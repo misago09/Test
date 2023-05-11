@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 80 92">
+  <path d="M40 0l39.837 23v46L40 92 .163 69V23L40 0z" fill="url(#F2NDZLuDMua)"/>
+  <defs>
+    <linearGradient id="F2NDZLuDMua" x1="6.458" y1="0" x2="77.375" y2="98.229" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#2A6CC5"/>
+      <stop offset="1" stop-color="#63D992"/>
+    </linearGradient>
+  </defs>
+</svg>
