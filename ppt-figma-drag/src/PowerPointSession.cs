@@ -2,15 +2,19 @@ using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 
 namespace PptFigmaDrag
 {
     internal sealed class ShapeInfo
     {
-        public int Index;        // 1-based index in Slide.Shapes at snapshot time
-        public int Id;           // Shape.Id, used to detect stale indexes
-        public RectPt Bounds;    // rotation-aware AABB in slide points
-        public bool WasSelected; // selected before the drag started
+        public int Index;              // 1-based index in Slide.Shapes at snapshot time
+        public int Id;                 // Shape.Id, used to detect stale indexes
+        public RectPt Bounds;          // rotation-aware AABB in slide points
+        public bool WasSelected;       // selected before the drag started
+        public bool IntersectSelectable; // false for prompt-only placeholders
+        public bool IsSegment;         // straight line/connector: use real geometry
+        public double SegX0, SegY0, SegX1, SegY1;
     }
 
     internal sealed class SlideSnapshot
@@ -19,6 +23,8 @@ namespace PptFigmaDrag
         public double DownPtX; // mouse-down position in slide points
         public double DownPtY;
         public int SlideIndex;
+        public int TotalShapeCount;    // Slide.Shapes.Count at mouse-down
+        public string PresentationName;
     }
 
     // Talks to a running PowerPoint instance over COM (late binding, so no Office
@@ -32,12 +38,26 @@ namespace PptFigmaDrag
         private const int PpViewSlide = 1;
         private const int PpSelectionShapes = 2;
         private const int PpSelectionText = 3;
+        private const int PpGuideHorizontal = 1;     // PpGuideOrientation
+        private const int PpGuideVertical = 2;
 
         // How far outside the slide edge (in screen px) a marquee may start.
         private const double CanvasMarginPx = 160.0;
         // Clicks this close (px) to an already-selected shape are treated as a
         // resize/rotate handle grab and left alone.
         private const double HandleMarginPx = 32.0;
+        // PowerPoint grabs shapes a few px around their outline (important for
+        // 0-height/0-width straight lines whose exact AABB is unhittable).
+        private const double HitPadPx = 4.0;
+        // Grab tolerance around a straight line/connector segment.
+        private const double LineGrabPx = 6.0;
+        private const int MsoLine = 9;               // msoShapeType.msoLine
+        private const int MsoConnectorStraight = 1;  // msoConnectorType
+        // Clicks this close (px) to an alignment guide are guide drags, not marquees.
+        private const double GuideMarginPx = 6.0;
+        // If PowerPoint's own (contained-only) marquee result lands after ours it
+        // overwrites our selection; wait this long, then re-apply once if needed.
+        private const int ReassertDelayMs = 90;
 
         private object _app;
 
@@ -67,6 +87,28 @@ namespace PptFigmaDrag
         [DllImport("user32.dll", CharSet = CharSet.Auto)]
         private static extern IntPtr FindWindow(string className, string windowName);
 
+        [StructLayout(LayoutKind.Sequential)]
+        private struct RECT
+        {
+            public int Left;
+            public int Top;
+            public int Right;
+            public int Bottom;
+        }
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
+
+        // Maps a point reported in a window's own (possibly DPI-virtualized)
+        // coordinate space to physical pixels; identity when the window is
+        // per-monitor DPI aware like this process. Windows 8.1+.
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool LogicalToPhysicalPointForPerMonitorDPI(IntPtr hwnd, ref POINT point);
+
+        private static bool _logicalToPhysicalAvailable = true;
+
         private static IntPtr WindowFromPointXY(int x, int y)
         {
             POINT p;
@@ -90,7 +132,7 @@ namespace PptFigmaDrag
         // Called on left-button-down. Returns a snapshot when the press starts a
         // marquee drag on the slide canvas of the active PowerPoint window, or
         // null when we should not interfere (click on a shape, other app, other
-        // pane, other view, handle grab, ...).
+        // pane, other view, handle grab, guide drag, ...).
         public SlideSnapshot TryBeginDrag(int screenX, int screenY)
         {
             IntPtr hwndAtPoint = WindowFromPointXY(screenX, screenY);
@@ -118,7 +160,7 @@ namespace PptFigmaDrag
                     return null;
 
                 double sx, sy, ox, oy;
-                if (!TryGetMapping(win, out sx, out sy, out ox, out oy))
+                if (!TryGetMapping(win, root, out sx, out sy, out ox, out oy))
                     return null;
 
                 double ptX = (screenX - ox) / sx;
@@ -128,27 +170,41 @@ namespace PptFigmaDrag
                 double slideW = Convert.ToDouble(pres.PageSetup.SlideWidth);
                 double slideH = Convert.ToDouble(pres.PageSetup.SlideHeight);
 
+                // The mapped slide must overlap the real (physical) window rect;
+                // if not, the mapping is garbage (e.g. unconvertible DPI setup) -
+                // doing nothing beats selecting the wrong shapes.
+                RECT windowRect;
+                if (GetWindowRect(root, out windowRect))
+                {
+                    RectPt slidePx = RectPt.FromCorners(ox, oy, ox + slideW * sx, oy + slideH * sy);
+                    RectPt winPx = RectPt.FromCorners(windowRect.Left, windowRect.Top,
+                        windowRect.Right, windowRect.Bottom);
+                    if (!slidePx.Intersects(winPx))
+                        return null;
+                }
+
                 // The drag must start on the slide or in the gray border right
-                // around it - not in the ribbon, thumbnails or notes.
+                // around it - not in the ribbon or far-away panes. (Drags that do
+                // start in the thumbnail/notes pane are also rejected at release
+                // time via the active-pane check in CompleteDrag.)
                 RectPt slideRect = RectPt.FromCorners(0.0, 0.0, slideW, slideH);
                 double canvasMarginPt = CanvasMarginPx / Math.Abs(sx);
                 if (!slideRect.Expand(canvasMarginPt).Contains(ptX, ptY))
                     return null;
 
-                // The press must land on the same child window that hosts the
-                // slide canvas (filters out sibling panes that overlap the
-                // expanded rect at high zoom-out).
-                int centerX = (int)Math.Round(ox + (slideW / 2.0) * sx);
-                int centerY = (int)Math.Round(oy + (slideH / 2.0) * sy);
-                IntPtr slidePane = WindowFromPointXY(centerX, centerY);
-                if (slidePane != IntPtr.Zero && hwndAtPoint != slidePane)
+                // Dragging an alignment guide must not be mistaken for a marquee.
+                if (IsNearGuide(pres, ptX, ptY, GuideMarginPx / Math.Abs(sx)))
                     return null;
 
                 dynamic slide = win.View.Slide;
                 int slideIndex = Convert.ToInt32(slide.SlideIndex);
 
-                HashSet<int> selectedIds = GetSelectedShapeIds(win);
+                int selectionType;
+                HashSet<int> selectedIds = GetSelectedShapeIds(win, out selectionType);
+                bool textEditing = selectionType == PpSelectionText;
                 double handleMarginPt = HandleMarginPx / Math.Abs(sx);
+                double hitPadPt = HitPadPx / Math.Abs(sx);
+                double lineGrabPt = LineGrabPx / Math.Abs(sx);
 
                 dynamic shapes = slide.Shapes;
                 int count = Convert.ToInt32(shapes.Count);
@@ -160,8 +216,6 @@ namespace PptFigmaDrag
                     {
                         dynamic s = shapes[i];
                         if (Convert.ToInt32(s.Visible) == MsoFalse)
-                            continue;
-                        if (IsEmptyPlaceholder(s))
                             continue;
 
                         double left = Convert.ToDouble(s.Left);
@@ -177,13 +231,71 @@ namespace PptFigmaDrag
                         info.Id = Convert.ToInt32(s.Id);
                         info.Bounds = RectPt.RotatedAabb(left, top, width, height, rotation);
                         info.WasSelected = selectedIds.Contains(info.Id);
+                        info.IntersectSelectable = !IsEmptyPlaceholder(s);
 
-                        // Press on a shape: PowerPoint will move/select it - not a marquee.
-                        if (info.Bounds.Contains(ptX, ptY))
-                            return null;
+                        // Straight lines/connectors get real segment geometry: their
+                        // AABB is a huge, mostly-empty rectangle.
+                        if (rotation == 0.0 && IsStraightLine(s))
+                        {
+                            bool hFlip = false;
+                            bool vFlip = false;
+                            try { hFlip = Convert.ToInt32(s.HorizontalFlip) != MsoFalse; }
+                            catch { }
+                            try { vFlip = Convert.ToInt32(s.VerticalFlip) != MsoFalse; }
+                            catch { }
+                            info.IsSegment = true;
+                            // Flips pick which frame diagonal the line occupies.
+                            if (hFlip == vFlip)
+                            {
+                                info.SegX0 = left; info.SegY0 = top;
+                                info.SegX1 = left + width; info.SegY1 = top + height;
+                            }
+                            else
+                            {
+                                info.SegX0 = left + width; info.SegY0 = top;
+                                info.SegX1 = left; info.SegY1 = top + height;
+                            }
+                        }
+
+                        // While editing text with autofit off, the text can render far
+                        // below the frame; drags there select text, not a marquee.
+                        if (textEditing && info.WasSelected && rotation == 0.0)
+                        {
+                            try
+                            {
+                                double textH = Convert.ToDouble(s.TextFrame.TextRange.BoundHeight);
+                                double extBottom = top + Math.Max(height, textH);
+                                if (extBottom > info.Bounds.Bottom)
+                                    info.Bounds = RectPt.FromCorners(info.Bounds.X, info.Bounds.Y,
+                                        info.Bounds.Right, extBottom);
+                            }
+                            catch
+                            {
+                            }
+                        }
+
+                        // Press on (or within grab tolerance of) a shape: PowerPoint
+                        // will move/select it - not a marquee. Prompt-only placeholders
+                        // are transparent to marquees unless currently selected.
+                        if (info.IntersectSelectable || info.WasSelected)
+                        {
+                            bool pressOnShape = info.IsSegment
+                                ? RectPt.DistancePointToSegment(ptX, ptY,
+                                      info.SegX0, info.SegY0, info.SegX1, info.SegY1) <= lineGrabPt
+                                : info.Bounds.Expand(hitPadPt).Contains(ptX, ptY);
+                            if (pressOnShape)
+                                return null;
+                        }
                         // Press right next to a selected shape: likely a handle grab.
-                        if (info.WasSelected && info.Bounds.Expand(handleMarginPt).Contains(ptX, ptY))
-                            return null;
+                        if (info.WasSelected)
+                        {
+                            bool nearHandle = info.IsSegment
+                                ? RectPt.DistancePointToSegment(ptX, ptY,
+                                      info.SegX0, info.SegY0, info.SegX1, info.SegY1) <= handleMarginPt
+                                : info.Bounds.Expand(handleMarginPt).Contains(ptX, ptY);
+                            if (nearHandle)
+                                return null;
+                        }
 
                         list.Add(info);
                     }
@@ -199,11 +311,13 @@ namespace PptFigmaDrag
                 snapshot.DownPtX = ptX;
                 snapshot.DownPtY = ptY;
                 snapshot.SlideIndex = slideIndex;
+                snapshot.TotalShapeCount = count;
+                snapshot.PresentationName = Convert.ToString(pres.Name);
                 return snapshot;
             }
             catch (COMException)
             {
-                Invalidate();
+                InvalidateIfDead();
                 return null;
             }
             catch (InvalidCastException)
@@ -236,15 +350,51 @@ namespace PptFigmaDrag
                 if (viewType != PpViewNormal && viewType != PpViewSlide)
                     return;
 
+                // By now PowerPoint has processed the click, so a drag that really
+                // happened in the thumbnail strip or notes pane has activated that
+                // pane - reject it.
+                try
+                {
+                    if (Convert.ToInt32(win.ActivePane.ViewType) != PpViewSlide)
+                        return;
+                }
+                catch
+                {
+                }
+
+                if (!string.Equals(Convert.ToString(win.Presentation.Name),
+                        snapshot.PresentationName, StringComparison.Ordinal))
+                    return;
+
                 dynamic slide = win.View.Slide;
                 if (Convert.ToInt32(slide.SlideIndex) != snapshot.SlideIndex)
                     return;
+
+                dynamic shapes = slide.Shapes;
+                int count = Convert.ToInt32(shapes.Count);
+                // Shape count changed: the drag DREW something (shape tool, text
+                // box, ink) or shapes were added/removed mid-drag. Not a marquee.
+                if (count != snapshot.TotalShapeCount)
+                    return;
+
+                // Everything PowerPoint itself ended up selecting must be a shape
+                // we knew about at mouse-down; otherwise the drag was something
+                // else entirely (e.g. a fast shape move that outran our snapshot).
+                HashSet<int> knownIds = new HashSet<int>();
+                foreach (ShapeInfo s in snapshot.Shapes)
+                    knownIds.Add(s.Id);
+                int selectionType;
+                foreach (int id in GetSelectedShapeIds(win, out selectionType))
+                {
+                    if (!knownIds.Contains(id))
+                        return;
+                }
 
                 // Recompute the mapping: the view may have auto-scrolled while the
                 // marquee ran. The anchor stays where it was in slide space, the
                 // release point is converted with the fresh mapping.
                 double sx, sy, ox, oy;
-                if (!TryGetMapping(win, out sx, out sy, out ox, out oy))
+                if (!TryGetMapping(win, foreground, out sx, out sy, out ox, out oy))
                     return;
                 double upPtX = (upX - ox) / sx;
                 double upPtY = (upY - oy) / sy;
@@ -254,30 +404,41 @@ namespace PptFigmaDrag
                 List<ShapeInfo> hits = new List<ShapeInfo>();
                 foreach (ShapeInfo s in snapshot.Shapes)
                 {
-                    if (s.Bounds.Intersects(band) || (shift && s.WasSelected))
+                    bool touched = s.IsSegment
+                        ? band.IntersectsSegment(s.SegX0, s.SegY0, s.SegX1, s.SegY1)
+                        : s.Bounds.Intersects(band);
+                    if ((s.IntersectSelectable && touched) || (shift && s.WasSelected))
                         hits.Add(s);
                 }
                 if (hits.Count == 0)
                     return; // nothing touched: PowerPoint's native result stands
 
-                dynamic shapes = slide.Shapes;
-                int count = Convert.ToInt32(shapes.Count);
                 object[] indexes = new object[hits.Count];
+                HashSet<int> desiredIds = new HashSet<int>();
                 for (int i = 0; i < hits.Count; i++)
                 {
                     ShapeInfo s = hits[i];
-                    // The slide changed under us (shape added/removed mid-drag):
-                    // indexes are stale, do not select the wrong shapes.
+                    // Stale index (shape replaced under us): do not select wrongly.
                     if (s.Index > count || Convert.ToInt32(shapes[s.Index].Id) != s.Id)
                         return;
                     indexes[i] = s.Index;
+                    desiredIds.Add(s.Id);
                 }
 
                 shapes.Range(indexes).Select();
+
+                // If PowerPoint was still finishing its own marquee handling, its
+                // native (contained-only) result can land after ours and overwrite
+                // it. That case shows up as the selection shrinking to a strict
+                // subset of what we just set - apply once more.
+                Thread.Sleep(ReassertDelayMs);
+                HashSet<int> after = GetSelectedShapeIds(win, out selectionType);
+                if (after.Count != desiredIds.Count && after.IsSubsetOf(desiredIds))
+                    shapes.Range(indexes).Select();
             }
             catch (COMException)
             {
-                Invalidate();
+                InvalidateIfDead();
             }
             catch (InvalidCastException)
             {
@@ -317,42 +478,98 @@ namespace PptFigmaDrag
         }
 
         // Screen px = offset + slide points * scale, sampled from the live window.
-        private static bool TryGetMapping(dynamic win, out double sx, out double sy, out double ox, out double oy)
+        // PointsToScreenPixels answers in POWERPOINT'S DPI-awareness context; when
+        // PowerPoint runs DPI-virtualized (MSI Office 2016, "optimize for
+        // compatibility" mode) those are not physical pixels, so both sample
+        // points are pushed through LogicalToPhysicalPointForPerMonitorDPI to
+        // line up with the physical coordinates our hook delivers.
+        private static bool TryGetMapping(dynamic win, IntPtr rootHwnd, out double sx, out double sy, out double ox, out double oy)
         {
             sx = 1.0;
             sy = 1.0;
             ox = 0.0;
             oy = 0.0;
 
-            int x0 = Convert.ToInt32(win.PointsToScreenPixelsX(0.0f));
-            int x1 = Convert.ToInt32(win.PointsToScreenPixelsX(1000.0f));
-            int y0 = Convert.ToInt32(win.PointsToScreenPixelsY(0.0f));
-            int y1 = Convert.ToInt32(win.PointsToScreenPixelsY(1000.0f));
+            POINT p0;
+            p0.X = Convert.ToInt32(win.PointsToScreenPixelsX(0.0f));
+            p0.Y = Convert.ToInt32(win.PointsToScreenPixelsY(0.0f));
+            POINT p1;
+            p1.X = Convert.ToInt32(win.PointsToScreenPixelsX(1000.0f));
+            p1.Y = Convert.ToInt32(win.PointsToScreenPixelsY(1000.0f));
 
-            sx = (x1 - x0) / 1000.0;
-            sy = (y1 - y0) / 1000.0;
-            ox = x0;
-            oy = y0;
+            if (rootHwnd != IntPtr.Zero && _logicalToPhysicalAvailable)
+            {
+                try
+                {
+                    POINT c0 = p0;
+                    POINT c1 = p1;
+                    if (LogicalToPhysicalPointForPerMonitorDPI(rootHwnd, ref c0) &&
+                        LogicalToPhysicalPointForPerMonitorDPI(rootHwnd, ref c1) &&
+                        c1.X != c0.X && c1.Y != c0.Y)
+                    {
+                        p0 = c0;
+                        p1 = c1;
+                    }
+                }
+                catch (EntryPointNotFoundException)
+                {
+                    _logicalToPhysicalAvailable = false; // pre-8.1 Windows
+                }
+            }
+
+            sx = (p1.X - p0.X) / 1000.0;
+            sy = (p1.Y - p0.Y) / 1000.0;
+            ox = p0.X;
+            oy = p0.Y;
 
             // ~1.33 px/pt at 100% zoom on 96 DPI; anything near zero means the
             // window is minimized or the answer is garbage.
             return Math.Abs(sx) > 0.01 && Math.Abs(sy) > 0.01;
         }
 
-        private static HashSet<int> GetSelectedShapeIds(dynamic win)
+        private static bool IsNearGuide(dynamic pres, double ptX, double ptY, double tolerancePt)
+        {
+            try
+            {
+                dynamic guides = pres.Guides;
+                int count = Convert.ToInt32(guides.Count);
+                for (int i = 1; i <= count; i++)
+                {
+                    dynamic guide = guides[i];
+                    int orientation = Convert.ToInt32(guide.Orientation);
+                    double position = Convert.ToDouble(guide.Position);
+                    if (orientation == PpGuideHorizontal && Math.Abs(ptY - position) <= tolerancePt)
+                        return true;
+                    if (orientation == PpGuideVertical && Math.Abs(ptX - position) <= tolerancePt)
+                        return true;
+                }
+            }
+            catch
+            {
+                // Guides API not available (older PowerPoint) - nothing to check.
+            }
+            return false;
+        }
+
+        // Selected shape Ids, normalized to top-level shapes: a selection inside a
+        // group (or text edited within a grouped shape) reports the child shape,
+        // whose Id never appears in Slide.Shapes.
+        private static HashSet<int> GetSelectedShapeIds(dynamic win, out int selectionType)
         {
             HashSet<int> ids = new HashSet<int>();
+            selectionType = 0;
             try
             {
                 dynamic sel = win.Selection;
                 int type = Convert.ToInt32(sel.Type);
+                selectionType = type;
                 if (type == PpSelectionShapes || type == PpSelectionText)
                 {
                     dynamic range = sel.ShapeRange;
                     int count = Convert.ToInt32(range.Count);
                     for (int i = 1; i <= count; i++)
                     {
-                        try { ids.Add(Convert.ToInt32(range[i].Id)); }
+                        try { ids.Add(TopLevelShapeId(range[i])); }
                         catch { }
                     }
                 }
@@ -361,6 +578,39 @@ namespace PptFigmaDrag
             {
             }
             return ids;
+        }
+
+        private static int TopLevelShapeId(dynamic shape)
+        {
+            dynamic current = shape;
+            for (int depth = 0; depth < 8; depth++)
+            {
+                dynamic parent;
+                try { parent = current.ParentGroup; } // throws for top-level shapes
+                catch { break; }
+                if (parent == null)
+                    break;
+                current = parent;
+            }
+            return Convert.ToInt32(current.Id);
+        }
+
+        // Straight line, or connector whose ConnectorFormat says straight. Elbow
+        // and curved connectors fall back to the AABB path.
+        private static bool IsStraightLine(dynamic shape)
+        {
+            try
+            {
+                if (Convert.ToInt32(shape.Type) == MsoLine)
+                    return true;
+                if (Convert.ToInt32(shape.Connector) != MsoFalse &&
+                    Convert.ToInt32(shape.ConnectorFormat.Type) == MsoConnectorStraight)
+                    return true;
+            }
+            catch
+            {
+            }
+            return false;
         }
 
         // Prompt-only placeholders ("Click to add title") cover big slide areas
@@ -405,6 +655,23 @@ namespace PptFigmaDrag
                 return;
             if (FindWindow(PptFrameClass, null) == IntPtr.Zero)
                 Invalidate();
+        }
+
+        // A COMException may just mean "PowerPoint is busy right now"; only tear
+        // the cached reference down (with its GC cost) when the app really died.
+        public void InvalidateIfDead()
+        {
+            if (_app == null)
+                return;
+            try
+            {
+                dynamic probe = _app;
+                Convert.ToString(probe.Name);
+            }
+            catch
+            {
+                Invalidate();
+            }
         }
 
         public void Invalidate()

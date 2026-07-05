@@ -43,6 +43,54 @@ namespace PptFigmaDrag
             return r;
         }
 
+        // True when the segment (x0,y0)-(x1,y1) touches this rectangle. Used for
+        // straight lines/connectors, whose AABB vastly overstates their real hit area.
+        public bool IntersectsSegment(double x0, double y0, double x1, double y1)
+        {
+            if (Contains(x0, y0) || Contains(x1, y1))
+                return true;
+            return SegmentsIntersect(x0, y0, x1, y1, X, Y, Right, Y) ||
+                   SegmentsIntersect(x0, y0, x1, y1, Right, Y, Right, Bottom) ||
+                   SegmentsIntersect(x0, y0, x1, y1, Right, Bottom, X, Bottom) ||
+                   SegmentsIntersect(x0, y0, x1, y1, X, Bottom, X, Y);
+        }
+
+        public static double DistancePointToSegment(double px, double py,
+            double x0, double y0, double x1, double y1)
+        {
+            double dx = x1 - x0;
+            double dy = y1 - y0;
+            double lengthSq = dx * dx + dy * dy;
+            double t = 0.0;
+            if (lengthSq > 0.0)
+            {
+                t = ((px - x0) * dx + (py - y0) * dy) / lengthSq;
+                if (t < 0.0) t = 0.0;
+                else if (t > 1.0) t = 1.0;
+            }
+            double ex = px - (x0 + t * dx);
+            double ey = py - (y0 + t * dy);
+            return Math.Sqrt(ex * ex + ey * ey);
+        }
+
+        private static double Cross(double ax, double ay, double bx, double by)
+        {
+            return ax * by - ay * bx;
+        }
+
+        // Proper (non-collinear) segment intersection; collinear grazing contact is
+        // treated as a miss, which is fine at marquee scale.
+        public static bool SegmentsIntersect(double ax0, double ay0, double ax1, double ay1,
+            double bx0, double by0, double bx1, double by1)
+        {
+            double d1 = Cross(ax1 - ax0, ay1 - ay0, bx0 - ax0, by0 - ay0);
+            double d2 = Cross(ax1 - ax0, ay1 - ay0, bx1 - ax0, by1 - ay0);
+            double d3 = Cross(bx1 - bx0, by1 - by0, ax0 - bx0, ay0 - by0);
+            double d4 = Cross(bx1 - bx0, by1 - by0, ax1 - bx0, ay1 - by0);
+            return ((d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0)) &&
+                   ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0));
+        }
+
         // Axis-aligned bounding box of a shape frame rotated around its center.
         public static RectPt RotatedAabb(double left, double top, double width, double height, double rotationDeg)
         {

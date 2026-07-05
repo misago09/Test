@@ -65,6 +65,8 @@ namespace PptFigmaDrag
             bool on = _enabledItem.Checked;
             _hook.Enabled = on;
             _notifyIcon.Icon = on ? _iconOn : _iconOff;
+            if (!on)
+                _worker.PostReleaseCom(); // don't keep PowerPoint pinned while off
         }
 
         private void OnDoubleClick(object sender, EventArgs e)

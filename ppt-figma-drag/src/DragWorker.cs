@@ -45,8 +45,20 @@ namespace PptFigmaDrag
             _signal.Set();
         }
 
+        // Lets the tray menu release PowerPoint COM references (e.g. when the
+        // user disables the feature) without touching COM off the worker thread.
+        public void PostReleaseCom()
+        {
+            MouseEvent ev = new MouseEvent();
+            ev.Kind = MouseEventKind.ReleaseCom;
+            Post(ev);
+        }
+
         private void Run()
         {
+            // Retries outgoing COM calls that PowerPoint rejects while busy.
+            OleMessageFilter.Register();
+
             while (!_stop)
             {
                 _signal.WaitOne();
@@ -55,12 +67,13 @@ namespace PptFigmaDrag
                 {
                     try
                     {
+                        OleMessageFilter.ResetRetryBudget();
                         Handle(ev);
                     }
                     catch
                     {
                         _drag = null;
-                        _ppt.Invalidate();
+                        _ppt.InvalidateIfDead();
                     }
                 }
             }
@@ -68,7 +81,12 @@ namespace PptFigmaDrag
 
         private void Handle(MouseEvent ev)
         {
-            if (ev.Kind == MouseEventKind.Down)
+            if (ev.Kind == MouseEventKind.ReleaseCom)
+            {
+                _drag = null;
+                _ppt.Invalidate();
+            }
+            else if (ev.Kind == MouseEventKind.Down)
             {
                 _drag = null;
                 // Ctrl/Alt drags carry their own PowerPoint semantics

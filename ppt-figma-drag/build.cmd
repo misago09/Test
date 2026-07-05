@@ -29,4 +29,4 @@ if errorlevel 1 (
 )
 
 echo.
-echo [OK] PptFigmaDrag.exe 생성 완료. 더블클릭하면 트레이에서 실행됩니다.
+echo [OK] Built PptFigmaDrag.exe - double-click it to run in the tray.

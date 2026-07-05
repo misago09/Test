@@ -7,7 +7,8 @@ namespace PptFigmaDrag
     internal enum MouseEventKind
     {
         Down,
-        Up
+        Up,
+        ReleaseCom // not a mouse event: tells the worker to drop its COM references
     }
 
     internal struct MouseEvent
