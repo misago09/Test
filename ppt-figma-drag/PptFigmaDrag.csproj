@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <RootNamespace>PptFigmaDrag</RootNamespace>
+    <AssemblyName>PptFigmaDrag</AssemblyName>
+    <!-- Kept at C# 5 so the csc.exe that ships inside Windows (build.cmd) can
+         compile the same sources without any SDK installed. -->
+    <LangVersion>5</LangVersion>
+    <ApplicationManifest>src\app.manifest</ApplicationManifest>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+  </PropertyGroup>
+
+  <!-- Explicit framework references instead of UseWindowsForms so the project
+       also compiles with SDKs that lack the WindowsDesktop workload (Linux CI). -->
+  <ItemGroup>
+    <Reference Include="System" />
+    <Reference Include="System.Core" />
+    <Reference Include="System.Drawing" />
+    <Reference Include="System.Windows.Forms" />
+    <Reference Include="Microsoft.CSharp" />
+  </ItemGroup>
+
+  <!-- Allows compiling (not running) this net48 project on non-Windows CI. -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="All" />
+  </ItemGroup>
+
+</Project>
