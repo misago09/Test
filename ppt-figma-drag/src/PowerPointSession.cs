@@ -448,6 +448,75 @@ namespace PptFigmaDrag
             }
         }
 
+        // Current slide-view mapping and identity, for the viewport monitor
+        // (wheel-pan clamping, slide guard, diagnostic log).
+        public bool TryGetViewport(out double ox, out double oy, out double sx, out double sy,
+            out double slideWpt, out double slideHpt, out int zoomPercent, out int slideIndex)
+        {
+            ox = 0.0; oy = 0.0; sx = 1.0; sy = 1.0;
+            slideWpt = 0.0; slideHpt = 0.0;
+            zoomPercent = 0;
+            slideIndex = 0;
+
+            dynamic app = GetApp();
+            if (app == null)
+                return false;
+
+            try
+            {
+                dynamic win = app.ActiveWindow;
+                int viewType = Convert.ToInt32(win.ViewType);
+                if (viewType != PpViewNormal && viewType != PpViewSlide)
+                    return false;
+
+                IntPtr root = GetForegroundWindow();
+                if (!ClassNameIs(root, PptFrameClass))
+                    root = FindWindow(PptFrameClass, null);
+
+                if (!TryGetMapping(win, root, out sx, out sy, out ox, out oy))
+                    return false;
+
+                dynamic pres = win.Presentation;
+                slideWpt = Convert.ToDouble(pres.PageSetup.SlideWidth);
+                slideHpt = Convert.ToDouble(pres.PageSetup.SlideHeight);
+                try { zoomPercent = Convert.ToInt32(win.View.Zoom); }
+                catch { }
+                try { slideIndex = Convert.ToInt32(win.View.Slide.SlideIndex); }
+                catch { }
+                return true;
+            }
+            catch (COMException)
+            {
+                InvalidateIfDead();
+                return false;
+            }
+            catch (InvalidCastException)
+            {
+                return false;
+            }
+            catch (FormatException)
+            {
+                return false;
+            }
+        }
+
+        public bool TryGotoSlide(int slideIndex)
+        {
+            dynamic app = GetApp();
+            if (app == null)
+                return false;
+            try
+            {
+                app.ActiveWindow.View.GotoSlide(slideIndex);
+                return true;
+            }
+            catch
+            {
+                InvalidateIfDead();
+                return false;
+            }
+        }
+
         private dynamic GetApp()
         {
             if (_app != null)

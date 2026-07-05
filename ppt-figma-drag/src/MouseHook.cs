@@ -1,6 +1,7 @@
 using System;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
+using System.Text;
 
 namespace PptFigmaDrag
 {
@@ -21,19 +22,38 @@ namespace PptFigmaDrag
         public bool Alt;
     }
 
-    // WH_MOUSE_LL global hook. System-wide pointer latency depends on how fast this
-    // callback returns, so it must never touch COM, draw, or block: left button
-    // down/up are copied into a lock-free queue and everything else passes straight
-    // through. Mouse-move events take the single "not a button message" branch.
+    // WH_MOUSE_LL global hook. System-wide pointer latency depends on how fast
+    // this callback returns, so it must never touch COM, draw, or block:
+    // - left down/up are copied into the marquee worker's queue;
+    // - middle down/up and wheel over the PowerPoint slide canvas are consumed
+    //   and forwarded to the gesture engine (pan/zoom);
+    // - mouse moves take a single volatile check, plus a tiny forward while a
+    //   middle-drag pan is active.
+    // Events synthesized from touch (incl. our own injection) are left alone.
     internal sealed class MouseHook : IDisposable
     {
         private const int WH_MOUSE_LL = 14;
+        private const int WM_MOUSEMOVE = 0x0200;
         private const int WM_LBUTTONDOWN = 0x0201;
         private const int WM_LBUTTONUP = 0x0202;
+        private const int WM_MBUTTONDOWN = 0x0207;
+        private const int WM_MBUTTONUP = 0x0208;
+        private const int WM_MOUSEWHEEL = 0x020A;
+        private const int WM_MOUSEHWHEEL = 0x020E;
 
+        private const int VK_LBUTTON = 0x01;
         private const int VK_SHIFT = 0x10;
         private const int VK_CONTROL = 0x11;
         private const int VK_MENU = 0x12;
+
+        private const uint LLMHF_INJECTED = 0x00000001;
+        // Mouse events synthesized from touch/pen carry this signature in extra info.
+        private const uint MI_WP_SIGNATURE = 0xFF515700;
+        private const uint MI_WP_SIGNATURE_MASK = 0xFFFFFF00;
+
+        private const uint GA_ROOT = 2;
+        private const string PptFrameClass = "PPTFrameClass";
+        private const string SlideCanvasClass = "mdiClass";
 
         private delegate IntPtr HookProc(int nCode, IntPtr wParam, IntPtr lParam);
 
@@ -54,6 +74,28 @@ namespace PptFigmaDrag
         private static extern IntPtr GetModuleHandle(string lpModuleName);
 
         [StructLayout(LayoutKind.Sequential)]
+        private struct POINT
+        {
+            public int X;
+            public int Y;
+        }
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr WindowFromPoint(POINT point);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetParent(IntPtr hwnd);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        private static extern int GetClassName(IntPtr hWnd, StringBuilder buffer, int maxCount);
+
+        [StructLayout(LayoutKind.Sequential)]
         private struct MSLLHOOKSTRUCT
         {
             public int PtX;
@@ -64,10 +106,18 @@ namespace PptFigmaDrag
             public IntPtr ExtraInfo;
         }
 
+        // TickCount of the last real (non-synthesized) left-button press anywhere.
+        // The slide guard uses it to avoid reverting deliberate user navigation.
+        public static volatile int LastLeftClickTick;
+
         private readonly DragWorker _worker;
+        private readonly GestureEngine _engine;
         private readonly HookProc _proc; // field keeps the delegate alive against GC
+        private readonly StringBuilder _classBuffer = new StringBuilder(128);
         private IntPtr _hook;
         private volatile bool _enabled = true;
+        private volatile bool _panZoomEnabled = true;
+        private bool _middleCaptured; // hook thread only
 
         public bool Enabled
         {
@@ -75,9 +125,16 @@ namespace PptFigmaDrag
             set { _enabled = value; }
         }
 
-        public MouseHook(DragWorker worker)
+        public bool PanZoomEnabled
+        {
+            get { return _panZoomEnabled; }
+            set { _panZoomEnabled = value; }
+        }
+
+        public MouseHook(DragWorker worker, GestureEngine engine)
         {
             _worker = worker;
+            _engine = engine;
             _proc = Callback;
         }
 
@@ -93,22 +150,187 @@ namespace PptFigmaDrag
                 throw new Win32Exception(Marshal.GetLastWin32Error(), "마우스 훅 설치에 실패했습니다.");
         }
 
+        private static bool IsSynthesized(ref MSLLHOOKSTRUCT data)
+        {
+            if ((data.Flags & LLMHF_INJECTED) != 0)
+                return true;
+            return IsTouchSynthesized(ref data);
+        }
+
+        // Only events that Windows synthesized from touch/pen (incl. our own
+        // injection). Precision-touchpad drivers inject wheel events with
+        // LLMHF_INJECTED but no touch signature - those are real user scrolling
+        // and the wheel path must still take them over.
+        private static bool IsTouchSynthesized(ref MSLLHOOKSTRUCT data)
+        {
+            ulong extra = (ulong)data.ExtraInfo.ToInt64();
+            return ((uint)extra & MI_WP_SIGNATURE_MASK) == MI_WP_SIGNATURE;
+        }
+
+        private bool ClassNameIs(IntPtr hwnd, string name)
+        {
+            if (hwnd == IntPtr.Zero)
+                return false;
+            _classBuffer.Length = 0;
+            if (GetClassName(hwnd, _classBuffer, _classBuffer.Capacity) == 0)
+                return false;
+            return string.Equals(_classBuffer.ToString(), name, StringComparison.OrdinalIgnoreCase);
+        }
+
+        // True when the point sits on PowerPoint's slide-editing canvas. The
+        // canvas class may be the leaf under the cursor or an ancestor of it
+        // (Office versions differ), so walk a few parents up.
+        private bool IsOnPptCanvas(int x, int y, out IntPtr canvasHwnd)
+        {
+            canvasHwnd = IntPtr.Zero;
+            POINT p;
+            p.X = x;
+            p.Y = y;
+            IntPtr current = WindowFromPoint(p);
+            for (int i = 0; i < 8 && current != IntPtr.Zero; i++)
+            {
+                if (ClassNameIs(current, SlideCanvasClass))
+                {
+                    canvasHwnd = current;
+                    break;
+                }
+                current = GetParent(current);
+            }
+            if (canvasHwnd == IntPtr.Zero)
+                return false;
+            IntPtr root = GetAncestor(canvasHwnd, GA_ROOT);
+            if (!ClassNameIs(root, PptFrameClass))
+            {
+                canvasHwnd = IntPtr.Zero;
+                return false;
+            }
+            return true;
+        }
+
+        private static int WheelDelta(uint mouseData)
+        {
+            return (short)((mouseData >> 16) & 0xFFFF);
+        }
+
         private IntPtr Callback(int nCode, IntPtr wParam, IntPtr lParam)
         {
-            if (nCode >= 0 && _enabled)
+            if (nCode >= 0)
             {
                 long msg = wParam.ToInt64();
-                if (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP)
+
+                if (msg == WM_MOUSEMOVE)
+                {
+                    // Hot path: one volatile read on every mouse move.
+                    if (_engine != null && _engine.MousePanActive)
+                    {
+                        MSLLHOOKSTRUCT move = (MSLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(MSLLHOOKSTRUCT));
+                        if (!IsSynthesized(ref move))
+                            _engine.MouseMoved(move.PtX, move.PtY);
+                    }
+                }
+                else if (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP)
                 {
                     MSLLHOOKSTRUCT data = (MSLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(MSLLHOOKSTRUCT));
-                    MouseEvent ev;
-                    ev.Kind = msg == WM_LBUTTONDOWN ? MouseEventKind.Down : MouseEventKind.Up;
-                    ev.X = data.PtX;
-                    ev.Y = data.PtY;
-                    ev.Shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-                    ev.Ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-                    ev.Alt = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
-                    _worker.Post(ev);
+                    // Touch-synthesized clicks (incl. taps) must not arm the marquee logic.
+                    if (!IsSynthesized(ref data))
+                    {
+                        if (msg == WM_LBUTTONDOWN)
+                            LastLeftClickTick = Environment.TickCount; // slide-guard: user navigation marker
+                        if (_enabled)
+                        {
+                            MouseEvent ev;
+                            ev.Kind = msg == WM_LBUTTONDOWN ? MouseEventKind.Down : MouseEventKind.Up;
+                            ev.X = data.PtX;
+                            ev.Y = data.PtY;
+                            ev.Shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+                            ev.Ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+                            ev.Alt = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+                            _worker.Post(ev);
+                        }
+                    }
+                }
+                else if (msg == WM_MBUTTONDOWN)
+                {
+                    // A capture whose button-up never reached this hook is stale.
+                    if (_middleCaptured && _engine != null && !_engine.MousePanActive)
+                        _middleCaptured = false;
+
+                    if (_panZoomEnabled && _engine != null && _engine.Ready)
+                    {
+                        MSLLHOOKSTRUCT data = (MSLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(MSLLHOOKSTRUCT));
+                        IntPtr canvas;
+                        if (!IsSynthesized(ref data) && IsOnPptCanvas(data.PtX, data.PtY, out canvas))
+                        {
+                            _middleCaptured = true;
+                            _engine.StartMousePan(data.PtX, data.PtY, canvas);
+                            return (IntPtr)1; // PowerPoint never sees this middle-drag
+                        }
+                    }
+                }
+                else if (msg == WM_MBUTTONUP)
+                {
+                    // Deliberately not gated on _panZoomEnabled: a pan in progress
+                    // must always be closeable, or the fingers stay down.
+                    if (_middleCaptured)
+                    {
+                        MSLLHOOKSTRUCT data = (MSLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(MSLLHOOKSTRUCT));
+                        if (!IsSynthesized(ref data))
+                        {
+                            _middleCaptured = false;
+                            bool wasActive = _engine != null && _engine.MousePanActive;
+                            if (_engine != null)
+                                _engine.EndMousePan(data.PtX, data.PtY);
+                            if (wasActive)
+                                return (IntPtr)1; // we consumed the matching down
+                        }
+                    }
+                }
+                else if (msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL)
+                {
+                    // While a middle-drag pan is running, wheel input must not fall
+                    // through to PowerPoint (native scrolling would fight the pan).
+                    if (_engine != null && _engine.MousePanActive)
+                    {
+                        IntPtr fgRoot = GetForegroundWindow();
+                        if (ClassNameIs(fgRoot, PptFrameClass))
+                            return (IntPtr)1;
+                    }
+                    else if (_panZoomEnabled && _engine != null && _engine.Ready)
+                    {
+                        MSLLHOOKSTRUCT data = (MSLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(MSLLHOOKSTRUCT));
+                        IntPtr canvas;
+                        if (!IsTouchSynthesized(ref data) &&
+                            (GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0 && // not during a left-drag (marquee/move)
+                            IsOnPptCanvas(data.PtX, data.PtY, out canvas) &&
+                            GetForegroundWindow() == GetAncestor(canvas, GA_ROOT)) // background wheel must not steal focus
+                        {
+                            int delta = WheelDelta(data.MouseData);
+                            bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+                            bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+
+                            if (msg == WM_MOUSEWHEEL && ctrl)
+                            {
+                                // Figma-style zoom around the cursor.
+                                _engine.AddPinchZoom(GestureEngine.WheelNotchesToZoomFactor(delta),
+                                    data.PtX, data.PtY, canvas);
+                            }
+                            else
+                            {
+                                // Smooth pan instead of line scrolling; clamped by the
+                                // engine so the view never jumps to another slide.
+                                double pan = GestureEngine.WheelNotchesToPanPx(delta);
+                                double dx = 0.0, dy = 0.0;
+                                if (msg == WM_MOUSEHWHEEL)
+                                    dx = -pan;
+                                else if (shift)
+                                    dx = pan;
+                                else
+                                    dy = pan;
+                                _engine.AddWheelPan(dx, dy, data.PtX, data.PtY, canvas);
+                            }
+                            return (IntPtr)1;
+                        }
+                    }
                 }
             }
             return CallNextHookEx(_hook, nCode, wParam, lParam);

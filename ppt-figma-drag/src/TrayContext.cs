@@ -14,8 +14,12 @@ namespace PptFigmaDrag
 
         private readonly NotifyIcon _notifyIcon;
         private readonly DragWorker _worker;
+        private readonly ViewportMonitor _monitor;
+        private readonly GestureEngine _engine;
         private readonly MouseHook _hook;
         private readonly ToolStripMenuItem _enabledItem;
+        private readonly ToolStripMenuItem _panZoomItem;
+        private readonly ToolStripMenuItem _logItem;
         private readonly ToolStripMenuItem _autoStartItem;
         private readonly Icon _iconOn;
         private readonly Icon _iconOff;
@@ -27,16 +31,28 @@ namespace PptFigmaDrag
         public TrayContext()
         {
             _worker = new DragWorker();
-            _hook = new MouseHook(_worker);
+            _monitor = new ViewportMonitor();
+            _engine = new GestureEngine(_monitor);
+            _hook = new MouseHook(_worker, _engine);
             _hook.Install();
 
             _iconOn = CreateIcon(true);
             _iconOff = CreateIcon(false);
 
-            _enabledItem = new ToolStripMenuItem("사용 (드래그에 걸친 도형까지 선택)");
+            _enabledItem = new ToolStripMenuItem("걸침 선택 (드래그에 닿은 도형까지 선택)");
             _enabledItem.Checked = true;
             _enabledItem.CheckOnClick = true;
             _enabledItem.CheckedChanged += OnEnabledChanged;
+
+            _panZoomItem = new ToolStripMenuItem("피그마식 이동/확대 (가운데 드래그 · 휠 · Ctrl+휠)");
+            _panZoomItem.Checked = true;
+            _panZoomItem.CheckOnClick = true;
+            _panZoomItem.CheckedChanged += OnPanZoomChanged;
+
+            _logItem = new ToolStripMenuItem("뷰포트 진단 로그 기록");
+            _logItem.Checked = false;
+            _logItem.CheckOnClick = true;
+            _logItem.CheckedChanged += OnLogChanged;
 
             _autoStartItem = new ToolStripMenuItem("Windows 시작 시 자동 실행");
             _autoStartItem.Checked = IsAutoStartRegistered();
@@ -48,6 +64,8 @@ namespace PptFigmaDrag
 
             ContextMenuStrip menu = new ContextMenuStrip();
             menu.Items.Add(_enabledItem);
+            menu.Items.Add(_panZoomItem);
+            menu.Items.Add(_logItem);
             menu.Items.Add(_autoStartItem);
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(exitItem);
@@ -62,11 +80,33 @@ namespace PptFigmaDrag
 
         private void OnEnabledChanged(object sender, EventArgs e)
         {
-            bool on = _enabledItem.Checked;
-            _hook.Enabled = on;
-            _notifyIcon.Icon = on ? _iconOn : _iconOff;
-            if (!on)
+            _hook.Enabled = _enabledItem.Checked;
+            if (!_enabledItem.Checked)
                 _worker.PostReleaseCom(); // don't keep PowerPoint pinned while off
+            UpdateIcon();
+        }
+
+        private void OnPanZoomChanged(object sender, EventArgs e)
+        {
+            _hook.PanZoomEnabled = _panZoomItem.Checked;
+            UpdateIcon();
+        }
+
+        private void UpdateIcon()
+        {
+            bool anyOn = _enabledItem.Checked || _panZoomItem.Checked;
+            _notifyIcon.Icon = anyOn ? _iconOn : _iconOff;
+        }
+
+        private void OnLogChanged(object sender, EventArgs e)
+        {
+            _monitor.LoggingEnabled = _logItem.Checked;
+            if (_logItem.Checked)
+            {
+                _notifyIcon.BalloonTipTitle = "PPT Figma Drag";
+                _notifyIcon.BalloonTipText = "뷰포트 로그: " + _monitor.LogPath;
+                _notifyIcon.ShowBalloonTip(4000);
+            }
         }
 
         private void OnDoubleClick(object sender, EventArgs e)
@@ -112,6 +152,8 @@ namespace PptFigmaDrag
         {
             _notifyIcon.Visible = false;
             _hook.Dispose();
+            _engine.Dispose();
+            _monitor.Dispose();
             _worker.Dispose();
             ExitThread();
         }
