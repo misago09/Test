@@ -886,6 +886,13 @@ namespace PptFigmaDrag
                     break;
                 }
             }
+
+            // Injected touch drags the visible pointer to the contact positions on
+            // EVERY frame - a long-lived gesture (continuous wheel/zoom) walked it
+            // to the screen edge before the end-of-gesture restore could act. Pin
+            // it back each tick; a middle-drag pan uses the real pointer, skip it.
+            if (_state == GState.WheelPan || _state == GState.Pinch)
+                SetCursorPos(_restoreCursorX, _restoreCursorY);
         }
 
         // Hold the fingers still for a few frames (kills DirectManipulation
