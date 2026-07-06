@@ -102,11 +102,16 @@ namespace PptFigmaDrag
         // the diagnostic to tell UIPI/elevation (5) from bad params (87) etc.
         public int LastError;
 
+        private const uint MaxContacts = 2;
+
         public bool Initialize()
         {
             try
             {
-                return InitializeTouchInjection(2, TOUCH_FEEDBACK_NONE);
+                // Contact pointer ids must be in [0, MaxContacts): with MaxContacts=2
+                // the only valid ids are 0 and 1. Using id 2 makes InjectTouchInput
+                // fail with ERROR_INVALID_PARAMETER (87).
+                return InitializeTouchInjection(MaxContacts, TOUCH_FEEDBACK_NONE);
             }
             catch (EntryPointNotFoundException)
             {
@@ -163,8 +168,8 @@ namespace PptFigmaDrag
         {
             ClampPairToVirtualScreen(ref x0, ref y0, ref x1, ref y1);
             uint flags = POINTER_FLAG_DOWN | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT;
-            FillContact(0, 1, x0, y0, flags);
-            FillContact(1, 2, x1, y1, flags);
+            FillContact(0, 0, x0, y0, flags);
+            FillContact(1, 1, x1, y1, flags);
             if (!InjectTouchInput(2, _frame))
             {
                 // Capture the real cause before Cancel's own InjectTouchInput
@@ -172,8 +177,8 @@ namespace PptFigmaDrag
                 LastError = Marshal.GetLastWin32Error();
                 // Contacts may be stuck from an earlier failed Up: cancel and retry once.
                 Cancel(x0, y0, x1, y1);
-                FillContact(0, 1, x0, y0, flags);
-                FillContact(1, 2, x1, y1, flags);
+                FillContact(0, 0, x0, y0, flags);
+                FillContact(1, 1, x1, y1, flags);
                 if (!InjectTouchInput(2, _frame))
                 {
                     LastError = Marshal.GetLastWin32Error();
@@ -191,8 +196,8 @@ namespace PptFigmaDrag
                 return false;
             ClampPairToVirtualScreen(ref x0, ref y0, ref x1, ref y1);
             uint flags = POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT;
-            FillContact(0, 1, x0, y0, flags);
-            FillContact(1, 2, x1, y1, flags);
+            FillContact(0, 0, x0, y0, flags);
+            FillContact(1, 1, x1, y1, flags);
             if (!InjectTouchInput(2, _frame))
                 return false;
             _x0 = x0; _y0 = y0; _x1 = x1; _y1 = y1;
@@ -210,8 +215,8 @@ namespace PptFigmaDrag
         {
             if (!_contactsDown)
                 return true;
-            FillContact(0, 1, _x0, _y0, POINTER_FLAG_UP);
-            FillContact(1, 2, _x1, _y1, POINTER_FLAG_UP);
+            FillContact(0, 0, _x0, _y0, POINTER_FLAG_UP);
+            FillContact(1, 1, _x1, _y1, POINTER_FLAG_UP);
             bool ok = InjectTouchInput(2, _frame);
             if (!ok)
                 Cancel(_x0, _y0, _x1, _y1); // last resort so contacts don't stay stuck
@@ -221,8 +226,8 @@ namespace PptFigmaDrag
 
         private void Cancel(int x0, int y0, int x1, int y1)
         {
-            FillContact(0, 1, x0, y0, POINTER_FLAG_UP | POINTER_FLAG_CANCELED);
-            FillContact(1, 2, x1, y1, POINTER_FLAG_UP | POINTER_FLAG_CANCELED);
+            FillContact(0, 0, x0, y0, POINTER_FLAG_UP | POINTER_FLAG_CANCELED);
+            FillContact(1, 1, x1, y1, POINTER_FLAG_UP | POINTER_FLAG_CANCELED);
             InjectTouchInput(2, _frame);
         }
 
