@@ -137,6 +137,12 @@ namespace PptFigmaDrag
             get { return _mousePanActive; }
         }
 
+        // Win32 error from the last failed touch injection (0 if none). Diagnostic only.
+        public int LastInjectError
+        {
+            get { return _injector.LastError; }
+        }
+
         // Diagnostic: on the engine thread, inject a visible two-finger pinch-zoom
         // at (x,y) and report whether every InjectTouchInput call succeeded.
         //  -1 = engine never became Ready (touch injection unavailable)

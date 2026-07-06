@@ -95,6 +95,10 @@ namespace PptFigmaDrag
             get { return _contactsDown; }
         }
 
+        // Win32 error from the most recent InjectTouchInput that failed. Read by
+        // the diagnostic to tell UIPI/elevation (5) from bad params (87) etc.
+        public int LastError;
+
         public bool Initialize()
         {
             try
@@ -160,12 +164,18 @@ namespace PptFigmaDrag
             FillContact(1, 2, x1, y1, flags);
             if (!InjectTouchInput(2, _frame))
             {
+                // Capture the real cause before Cancel's own InjectTouchInput
+                // overwrites the thread's last-error.
+                LastError = Marshal.GetLastWin32Error();
                 // Contacts may be stuck from an earlier failed Up: cancel and retry once.
                 Cancel(x0, y0, x1, y1);
                 FillContact(0, 1, x0, y0, flags);
                 FillContact(1, 2, x1, y1, flags);
                 if (!InjectTouchInput(2, _frame))
+                {
+                    LastError = Marshal.GetLastWin32Error();
                     return false;
+                }
             }
             _x0 = x0; _y0 = y0; _x1 = x1; _y1 = y1;
             _contactsDown = true;
