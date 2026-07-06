@@ -163,6 +163,12 @@ namespace PptFigmaDrag
                 r.Append("InjectTouchInput 호출 실패 ✗   (GetLastError = ").Append(err)
                  .Append(" ").Append(ErrorName(err)).Append(")\r\n");
                 r.Append("   ").Append(ExplainError(err, remote)).Append("\r\n");
+                string probe = engine.LastProbeReport;
+                if (probe != null)
+                {
+                    r.Append("\r\n파라미터 프로브 (성공하는 변형을 찾습니다):\r\n");
+                    r.Append(probe).Append("\r\n");
+                }
             }
             else
                 r.Append("InjectTouchInput 호출 성공 ✓\r\n" +

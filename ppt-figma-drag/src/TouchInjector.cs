@@ -1,5 +1,6 @@
 using System;
 using System.Runtime.InteropServices;
+using System.Text;
 
 namespace PptFigmaDrag
 {
@@ -21,6 +22,8 @@ namespace PptFigmaDrag
         private const uint TOUCH_MASK_ORIENTATION = 0x00000002;
         private const uint TOUCH_MASK_PRESSURE = 0x00000004;
 
+        private const int SM_CXSCREEN = 0;
+        private const int SM_CYSCREEN = 1;
         private const int SM_XVIRTUALSCREEN = 76;
         private const int SM_YVIRTUALSCREEN = 77;
         private const int SM_CXVIRTUALSCREEN = 78;
@@ -221,6 +224,68 @@ namespace PptFigmaDrag
             FillContact(0, 1, x0, y0, POINTER_FLAG_UP | POINTER_FLAG_CANCELED);
             FillContact(1, 2, x1, y1, POINTER_FLAG_UP | POINTER_FLAG_CANCELED);
             InjectTouchInput(2, _frame);
+        }
+
+        // Diagnostic: try several parameter variants of a DOWN+UP at (x,y) and
+        // report which succeed. Whichever variant works pinpoints the field that
+        // Windows was rejecting with ERROR_INVALID_PARAMETER.
+        public string ProbeAll(int x, int y)
+        {
+            uint full = TOUCH_MASK_CONTACTAREA | TOUCH_MASK_ORIENTATION | TOUCH_MASK_PRESSURE;
+            StringBuilder sb = new StringBuilder();
+            sb.Append("   A. 2접점·풀마스크(기본): ").Append(ProbeOne(x, y, 2, full, 1, 24)).Append("\r\n");
+            sb.Append("   B. 1접점(단일 손가락):   ").Append(ProbeOne(x, y, 1, full, 1, 0)).Append("\r\n");
+            sb.Append("   C. 2접점·접점영역만:     ").Append(ProbeOne(x, y, 2, TOUCH_MASK_CONTACTAREA, 1, 24)).Append("\r\n");
+            sb.Append("   D. 2접점·마스크 없음:    ").Append(ProbeOne(x, y, 2, 0, 1, 24)).Append("\r\n");
+            sb.Append("   E. 2접점·id 0시작:       ").Append(ProbeOne(x, y, 2, full, 0, 24)).Append("\r\n");
+            int px = GetSystemMetrics(SM_CXSCREEN) / 2;
+            int py = GetSystemMetrics(SM_CYSCREEN) / 2;
+            sb.Append("   F. 주모니터 중앙·2접점:  ").Append(ProbeOne(px, py, 2, full, 1, 24));
+            return sb.ToString();
+        }
+
+        private string ProbeOne(int x, int y, int contacts, uint mask, uint startId, int spread)
+        {
+            POINTER_TOUCH_INFO[] frame = new POINTER_TOUCH_INFO[contacts];
+            uint down = POINTER_FLAG_DOWN | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT;
+            for (int i = 0; i < contacts; i++)
+            {
+                int cx = contacts == 1 ? x : (i == 0 ? x - spread : x + spread);
+                frame[i] = MakeContact(startId + (uint)i, cx, y, down, mask);
+            }
+            if (!InjectTouchInput((uint)contacts, frame))
+                return "실패(err=" + Marshal.GetLastWin32Error() + ")";
+
+            for (int i = 0; i < contacts; i++)
+            {
+                int cx = contacts == 1 ? x : (i == 0 ? x - spread : x + spread);
+                frame[i] = MakeContact(startId + (uint)i, cx, y, POINTER_FLAG_UP, mask);
+            }
+            InjectTouchInput((uint)contacts, frame);
+            return "성공 ✓";
+        }
+
+        private static POINTER_TOUCH_INFO MakeContact(uint id, int x, int y, uint flags, uint mask)
+        {
+            POINTER_TOUCH_INFO info = new POINTER_TOUCH_INFO();
+            info.PointerInfo.PointerType = PT_TOUCH;
+            info.PointerInfo.PointerId = id;
+            info.PointerInfo.PointerFlags = flags;
+            info.PointerInfo.PtPixelLocation.X = x;
+            info.PointerInfo.PtPixelLocation.Y = y;
+            info.TouchMask = mask;
+            if ((mask & TOUCH_MASK_CONTACTAREA) != 0)
+            {
+                info.Contact.Left = x - 2;
+                info.Contact.Top = y - 2;
+                info.Contact.Right = x + 2;
+                info.Contact.Bottom = y + 2;
+            }
+            if ((mask & TOUCH_MASK_ORIENTATION) != 0)
+                info.Orientation = 90;
+            if ((mask & TOUCH_MASK_PRESSURE) != 0)
+                info.Pressure = 512;
+            return info;
         }
     }
 }

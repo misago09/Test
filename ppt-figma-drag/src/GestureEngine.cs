@@ -81,6 +81,7 @@ namespace PptFigmaDrag
         private volatile bool _ready;
         private volatile bool _mousePanActive;
         private volatile bool _selfTestOk;
+        private volatile string _probeReport;
 
         // Latest cursor position while a mouse pan is active (coalesced). Packed
         // into one long so the engine thread never reads a torn x/y pair; only
@@ -141,6 +142,12 @@ namespace PptFigmaDrag
         public int LastInjectError
         {
             get { return _injector.LastError; }
+        }
+
+        // Parameter-probe report from the last failed self-test (null if none).
+        public string LastProbeReport
+        {
+            get { return _probeReport; }
         }
 
         // Diagnostic: on the engine thread, inject a visible two-finger pinch-zoom
@@ -285,6 +292,8 @@ namespace PptFigmaDrag
                     Thread.Sleep(FrameMs);
                     bool up = _injector.Up();
                     _selfTestOk = ok && up;
+                    // On failure, probe parameter variants to find what Windows rejects.
+                    _probeReport = _selfTestOk ? null : _injector.ProbeAll(c.X, c.Y);
                     _selfTestDone.Set();
                     break;
                 }
