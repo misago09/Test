@@ -121,10 +121,12 @@ namespace PptFigmaDrag
         private void OnLogChanged(object sender, EventArgs e)
         {
             _monitor.LoggingEnabled = _logItem.Checked;
+            DiagLog.Enabled = _logItem.Checked;
             if (_logItem.Checked)
             {
                 _notifyIcon.BalloonTipTitle = "PPT Figma Drag";
-                _notifyIcon.BalloonTipText = "뷰포트 로그: " + _monitor.LogPath;
+                _notifyIcon.BalloonTipText = "기록 중: event-log.txt + viewport-log.csv\r\n" +
+                    System.IO.Path.GetDirectoryName(DiagLog.LogPath);
                 _notifyIcon.ShowBalloonTip(4000);
             }
         }

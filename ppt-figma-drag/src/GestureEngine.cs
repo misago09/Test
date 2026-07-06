@@ -188,6 +188,14 @@ namespace PptFigmaDrag
         private RECT _pinchRect;
         private bool _pinchRectValid;
         private IntPtr _pinchCanvasHwnd;
+        // Closed-loop anchor lock: PowerPoint re-clamps the view into its scroll
+        // extent while zooming, dragging the anchor toward the view centre. We
+        // measure where the anchored slide point actually is each sample and
+        // translate the finger pair to pull it back under the cursor.
+        private double _pinchAnchorSlideX, _pinchAnchorSlideY;
+        private bool _pinchAnchorValid;
+        private double _pinchTransX, _pinchTransY;
+        private int _pinchCorrTick;
 
         // Diagnostics
         private volatile string _lastRoomsInfo = "(아직 휠 제스처 없음)";
@@ -446,6 +454,9 @@ namespace PptFigmaDrag
                     _wheelTargetX = ClampWheelTargetX(_wheelTargetX + c.Dx);
                     _wheelTargetY = ClampWheelTargetY(_wheelTargetY + c.Dy);
                     _lastNotchTick = Environment.TickCount;
+                    DiagLog.Log("ENG", "wheel notch d=(" + (int)c.Dx + "," + (int)c.Dy +
+                        ") tgt=(" + (int)_wheelTargetX + "," + (int)_wheelTargetY +
+                        ") inj=(" + (int)_wheelInjectedX + "," + (int)_wheelInjectedY + ")");
                     break;
 
                 case CmdKind.Pinch:
@@ -486,12 +497,28 @@ namespace PptFigmaDrag
                         _pinchCanvasHwnd = c.CanvasHwnd;
                         _pinchRectValid = c.CanvasHwnd != IntPtr.Zero &&
                                           GetWindowRect(c.CanvasHwnd, out _pinchRect);
+                        _pinchTransX = 0.0;
+                        _pinchTransY = 0.0;
+                        _pinchAnchorValid = false;
+                        _pinchCorrTick = 0;
+                        ViewportState seed = _monitor.Current;
+                        if (seed != null && seed.Valid &&
+                            Environment.TickCount - seed.TickMs < 300 &&
+                            Math.Abs(seed.Sx) > 0.0001 && Math.Abs(seed.Sy) > 0.0001)
+                        {
+                            _pinchAnchorSlideX = (c.X - seed.Ox) / seed.Sx;
+                            _pinchAnchorSlideY = (c.Y - seed.Oy) / seed.Sy;
+                            _pinchAnchorValid = true;
+                            _pinchCorrTick = seed.TickMs;
+                        }
                         if (!_injector.Down((int)Math.Round(_pinchCenterX - _pinchHalf), cy,
                                             (int)Math.Round(_pinchCenterX + _pinchHalf), cy))
                             break;
                         _state = GState.Pinch;
                         _wheelPinchActive = true;
                         _monitor.BeginGestureSampling("pinch");
+                        DiagLog.Log("ENG", "pinch start @(" + c.X + "," + c.Y + ") half=" + startHalf +
+                            " seed=" + (_pinchAnchorValid ? "yes" : "no"));
                     }
                     {
                         double target = _pinchTargetHalf * c.Dx;
@@ -504,6 +531,7 @@ namespace PptFigmaDrag
                             // event's coordinates are the WALKED cursor position -
                             // keep the fresh leg anchored where the zoom began, or
                             // the anchor creeps to the screen edge leg by leg.
+                            DiagLog.Log("ENG", "pinch cap re-anchor");
                             Cmd again = c;
                             again.X = (int)Math.Round(_pinchCursorX);
                             again.Y = (int)Math.Round(_pinchCursorY);
@@ -539,12 +567,18 @@ namespace PptFigmaDrag
             // viewport info we cannot bound the pan, so dropping the notch is
             // strictly better than guessing.
             if (!clamped)
+            {
+                DiagLog.Log("ENG", "wheel drop: no viewport sample");
                 return false;
+            }
             // No scroll room in the requested direction (e.g. the slide fits the
             // window): don't bother with a gesture that would move nothing.
             if (Math.Abs(ClampWheelTargetX(c.Dx)) < 1.0 &&
                 Math.Abs(ClampWheelTargetY(c.Dy)) < 1.0)
+            {
+                DiagLog.Log("ENG", "wheel drop: no room (" + _lastRoomsInfo + ")");
                 return false;
+            }
 
             int startX = c.X, startY = c.Y;
             ClampContactCenter(c.CanvasHwnd, ContactSpreadPx, ref startX, ref startY);
@@ -560,6 +594,8 @@ namespace PptFigmaDrag
             _wheelPinchActive = true;
             _monitor.BeginGestureSampling("wheel");
             _monitor.BeginSlideGuard(); // backstop in case a flip slips through anyway
+            DiagLog.Log("ENG", "wheel start @(" + c.X + "," + c.Y + ") slide=" + _wheelStartSlide +
+                " " + _lastRoomsInfo);
             return true;
         }
 
@@ -629,7 +665,9 @@ namespace PptFigmaDrag
             double rectW = _wheelRect.Right - _wheelRect.Left;
             double rectH = _wheelRect.Bottom - _wheelRect.Top;
             bool overflow = vs.SlideWpt * vs.Sx > rectW || vs.SlideHpt * vs.Sy > rectH;
-            double marginY = overflow ? 60.0 : 0.0;   // vertical overshoot risks a slide flip
+            // No vertical margin: past the slide's top/bottom lies the neighboring
+            // slide, and even 60px of allowance caused escape-and-revert jumps.
+            double marginY = 0.0;
             double marginX = overflow ? 250.0 : 0.0;  // sideways there is no next slide
 
             double slideRight = vs.Ox + vs.SlideWpt * vs.Sx;
@@ -743,6 +781,8 @@ namespace PptFigmaDrag
                         {
                             // Escaped onto another slide despite the clamp: stop
                             // pushing immediately; the monitor reverts the slide.
+                            DiagLog.Log("ENG", "wheel slide-escape " + _wheelStartSlide +
+                                "->" + liveVs.SlideIndex + ", freezing");
                             _wheelTargetX = _wheelInjectedX;
                             _wheelTargetY = _wheelInjectedY;
                         }
@@ -761,13 +801,25 @@ namespace PptFigmaDrag
                             double viewDx = liveVs.Ox - _stallPrevOx;
                             double viewDy = liveVs.Oy - _stallPrevOy;
                             if (Math.Abs(injDx) > 40.0 && Math.Abs(viewDx) < Math.Abs(injDx) * 0.15)
+                            {
+                                DiagLog.Log("ENG", "wheel stall X inj=" + (int)injDx + " view=" + (int)viewDx);
                                 _wheelTargetX = _wheelInjectedX;
+                            }
                             if (Math.Abs(injDy) > 40.0 && Math.Abs(viewDy) < Math.Abs(injDy) * 0.15)
+                            {
+                                DiagLog.Log("ENG", "wheel stall Y inj=" + (int)injDy + " view=" + (int)viewDy);
                                 _wheelTargetY = _wheelInjectedY;
+                            }
 
                             ApplyRooms(liveVs);
                             _wheelTargetX = ClampWheelTargetX(_wheelTargetX);
                             _wheelTargetY = ClampWheelTargetY(_wheelTargetY);
+                            DiagLog.Log("ENG", "vp o=(" + (int)liveVs.Ox + "," + (int)liveVs.Oy +
+                                ") zoom=" + liveVs.ZoomPercent + "% slide=" + liveVs.SlideIndex +
+                                " inj=(" + (int)_wheelInjectedX + "," + (int)_wheelInjectedY +
+                                ") tgt=(" + (int)_wheelTargetX + "," + (int)_wheelTargetY +
+                                ") roomY=" + (int)_roomPosY + "/" + (int)_roomNegY +
+                                " roomX=" + (int)_roomPosX + "/" + (int)_roomNegX);
                         }
                     }
 
@@ -825,18 +877,62 @@ namespace PptFigmaDrag
 
                 case GState.Pinch:
                 {
-                    bool moved = false;
+                    double prevHalf = _pinchHalf;
                     if (_pinchHalf != _pinchTargetHalf)
-                    {
-                        double prevHalf = _pinchHalf;
                         _pinchHalf = StepToward(_pinchHalf, _pinchTargetHalf, MaxPinchStepPx);
-                        double cx = _pinchCenterX;
-                        double cy = _pinchCenterY;
 
-                        // If the spreading pair is about to leave the canvas (where
-                        // the virtual-screen clamp would shift the centroid and drag
-                        // the zoom anchor off the cursor), lift and restart a fresh
-                        // leg at the cursor with the residual zoom.
+                    // Closed-loop anchor lock: measure where the anchored slide
+                    // point actually sits and pull it back under the cursor by
+                    // translating the pair (PowerPoint pans and zooms in one
+                    // gesture). This runs even after the spread settles, so the
+                    // final zoom frames get corrected too.
+                    bool transStepped = false;
+                    ViewportState pinchVs = _monitor.Current;
+                    if (pinchVs != null && pinchVs.Valid && pinchVs.TickMs != _pinchCorrTick &&
+                        Math.Abs(pinchVs.Sx) > 0.0001 && Math.Abs(pinchVs.Sy) > 0.0001)
+                    {
+                        _pinchCorrTick = pinchVs.TickMs;
+                        if (!_pinchAnchorValid)
+                        {
+                            _pinchAnchorSlideX = (_pinchCursorX - pinchVs.Ox) / pinchVs.Sx;
+                            _pinchAnchorSlideY = (_pinchCursorY - pinchVs.Oy) / pinchVs.Sy;
+                            _pinchAnchorValid = true;
+                        }
+                        else
+                        {
+                            double errX = _pinchCursorX - (pinchVs.Ox + _pinchAnchorSlideX * pinchVs.Sx);
+                            double errY = _pinchCursorY - (pinchVs.Oy + _pinchAnchorSlideY * pinchVs.Sy);
+                            if (Math.Abs(errX) > 2.0)
+                            {
+                                _pinchTransX += ClampStep(errX * 0.6, 30.0);
+                                transStepped = true;
+                            }
+                            if (Math.Abs(errY) > 2.0)
+                            {
+                                _pinchTransY += ClampStep(errY * 0.6, 30.0);
+                                transStepped = true;
+                            }
+                            if (_pinchTransX > 500.0) _pinchTransX = 500.0;
+                            else if (_pinchTransX < -500.0) _pinchTransX = -500.0;
+                            if (_pinchTransY > 500.0) _pinchTransY = 500.0;
+                            else if (_pinchTransY < -500.0) _pinchTransY = -500.0;
+                            if (transStepped)
+                                DiagLog.Log("ENG", "pinch corr err=(" + (int)errX + "," + (int)errY +
+                                    ") trans=(" + (int)_pinchTransX + "," + (int)_pinchTransY +
+                                    ") half=" + (int)_pinchHalf + " zoom=" + pinchVs.ZoomPercent + "%");
+                        }
+                    }
+
+                    bool moved = false;
+                    if (_pinchHalf != prevHalf || transStepped)
+                    {
+                        double cx = _pinchCenterX + _pinchTransX;
+                        double cy = _pinchCenterY + _pinchTransY;
+
+                        // If the pair is about to leave the canvas (where the
+                        // virtual-screen clamp would shift the centroid and drag the
+                        // zoom anchor off the cursor), lift and restart a fresh leg
+                        // at the cursor with the residual zoom.
                         if (_pinchRectValid &&
                             (cx - _pinchHalf < _pinchRect.Left + CanvasEdgeInsetPx ||
                              cx + _pinchHalf > _pinchRect.Right - CanvasEdgeInsetPx ||
@@ -858,10 +954,14 @@ namespace PptFigmaDrag
                             _pinchCenterX = ncx;
                             _pinchCenterY = ncy;
                             _pinchHalf = startHalf;
+                            _pinchTransX = 0.0; // the delivered pan is baked into the view
+                            _pinchTransY = 0.0;
                             double newTarget = startHalf * remaining;
                             if (newTarget < PinchMinHalfPx) newTarget = PinchMinHalfPx;
                             if (newTarget > PinchMaxHalfPx) newTarget = PinchMaxHalfPx;
                             _pinchTargetHalf = newTarget;
+                            DiagLog.Log("ENG", "pinch edge re-anchor half=" + startHalf +
+                                " target=" + (int)newTarget);
 
                             if (!_injector.Down(ncx - startHalf, ncy, ncx + startHalf, ncy))
                             {
@@ -927,6 +1027,9 @@ namespace PptFigmaDrag
 
         private void EndGestureBookkeeping()
         {
+            if (_state != GState.Idle)
+                DiagLog.Log("ENG", "gesture end " + _state +
+                    " inj=(" + (int)_wheelInjectedX + "," + (int)_wheelInjectedY + ")");
             if (_state == GState.WheelPan)
                 _monitor.EndSlideGuard();
             if (_state != GState.Idle)

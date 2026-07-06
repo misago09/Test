@@ -348,9 +348,11 @@ namespace PptFigmaDrag
                             _lastMiddleGate = "소비: 팬 시작";
                             _cntMiddle++;
                             _middleCaptured = true;
+                            DiagLog.Log("HOOK", "mdown@(" + data.PtX + "," + data.PtY + ") -> 팬 시작");
                             _engine.StartMousePan(data.PtX, data.PtY, canvas);
                             return (IntPtr)1; // PowerPoint never sees this middle-drag
                         }
+                        DiagLog.Log("HOOK", "mdown@(" + data.PtX + "," + data.PtY + ") -> " + _lastMiddleGate);
                     }
                 }
                 else if (msg == WM_MBUTTONUP)
@@ -448,8 +450,12 @@ namespace PptFigmaDrag
                                     dy = pan;
                                 _engine.AddWheelPan(dx, dy, data.PtX, data.PtY, canvas);
                             }
+                            DiagLog.Log("HOOK", "wheel@(" + data.PtX + "," + data.PtY + ") d=" + delta +
+                                (ctrl ? " ctrl" : "") + (shift ? " shift" : "") +
+                                (msg == WM_MOUSEHWHEEL ? " hwheel" : "") + " -> " + _lastWheelGate);
                             return (IntPtr)1;
                         }
+                        DiagLog.Log("HOOK", "wheel@(" + data.PtX + "," + data.PtY + ") -> " + _lastWheelGate);
                     }
                 }
             }

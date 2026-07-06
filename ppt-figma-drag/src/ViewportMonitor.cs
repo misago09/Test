@@ -234,7 +234,10 @@ namespace PptFigmaDrag
             lock (_guardLock)
             {
                 if (vs.Valid && vs.SlideIndex > 0 && _guardArmed && _guardSlideIndex == 0)
+                {
                     _guardSlideIndex = vs.SlideIndex;
+                    DiagLog.Log("GUARD", "baseline slide=" + vs.SlideIndex);
+                }
 
                 // Escape detected while the gesture is still running: revert right
                 // away instead of waiting for the end-of-gesture deadline. The
@@ -244,6 +247,7 @@ namespace PptFigmaDrag
                     vs.SlideIndex != _guardSlideIndex &&
                     Environment.TickCount - MouseHook.LastLeftClickTick >= 400)
                 {
+                    DiagLog.Log("GUARD", "mid-gesture escape " + _guardSlideIndex + "->" + vs.SlideIndex);
                     revertTo = _guardSlideIndex;
                 }
 
@@ -278,8 +282,11 @@ namespace PptFigmaDrag
                 }
             }
 
+            if (revertTo > 0)
+                DiagLog.Log("GUARD", "revert -> slide " + revertTo);
             if (revertTo > 0 && !_session.TryGotoSlide(revertTo))
             {
+                DiagLog.Log("GUARD", "revert FAILED");
                 lock (_guardLock)
                 {
                     if (_guardVerifyAttempts < 5 && !_guardArmed)
