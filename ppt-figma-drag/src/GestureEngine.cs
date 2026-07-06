@@ -37,7 +37,8 @@ namespace PptFigmaDrag
             PanStart,
             PanEnd,
             Wheel,
-            Pinch
+            Pinch,
+            SelfTest
         }
 
         private struct Cmd
@@ -75,9 +76,11 @@ namespace PptFigmaDrag
         private readonly ConcurrentQueue<Cmd> _queue = new ConcurrentQueue<Cmd>();
         private readonly AutoResetEvent _signal = new AutoResetEvent(false);
         private readonly Thread _thread;
+        private readonly AutoResetEvent _selfTestDone = new AutoResetEvent(false);
         private volatile bool _stop;
         private volatile bool _ready;
         private volatile bool _mousePanActive;
+        private volatile bool _selfTestOk;
 
         // Latest cursor position while a mouse pan is active (coalesced). Packed
         // into one long so the engine thread never reads a torn x/y pair; only
@@ -132,6 +135,24 @@ namespace PptFigmaDrag
         public bool MousePanActive
         {
             get { return _mousePanActive; }
+        }
+
+        // Diagnostic: on the engine thread, inject a visible two-finger pinch-zoom
+        // at (x,y) and report whether every InjectTouchInput call succeeded.
+        //  -1 = engine never became Ready (touch injection unavailable)
+        //   0 = injection API call failed (permission / UIPI / bad coords)
+        //   1 = all injection calls returned success
+        public int RunSelfTest(int x, int y)
+        {
+            if (!_ready)
+                return -1;
+            Cmd c = new Cmd();
+            c.Kind = CmdKind.SelfTest;
+            c.X = x;
+            c.Y = y;
+            Post(c);
+            _selfTestDone.WaitOne(2000);
+            return _selfTestOk ? 1 : 0;
         }
 
         #region hook-side entry points (must stay cheap)
@@ -239,6 +260,29 @@ namespace PptFigmaDrag
         {
             switch (c.Kind)
             {
+                case CmdKind.SelfTest:
+                {
+                    if (_state != GState.Idle)
+                        FinishGesture();
+                    // Visible pinch-zoom-in around the cursor: always shows if
+                    // PowerPoint accepts injected touch, regardless of scroll room.
+                    bool ok = true;
+                    int half = 40;
+                    ok = _injector.Down(c.X - half, c.Y, c.X + half, c.Y);
+                    for (int i = 0; i < 12 && ok; i++)
+                    {
+                        half += 9;
+                        ok = _injector.Move(c.X - half, c.Y, c.X + half, c.Y);
+                        Thread.Sleep(FrameMs * 2);
+                    }
+                    _injector.Hold();
+                    Thread.Sleep(FrameMs);
+                    bool up = _injector.Up();
+                    _selfTestOk = ok && up;
+                    _selfTestDone.Set();
+                    break;
+                }
+
                 case CmdKind.PanStart:
                 {
                     if (_state != GState.Idle)

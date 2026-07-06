@@ -20,7 +20,9 @@ namespace PptFigmaDrag
         private readonly ToolStripMenuItem _enabledItem;
         private readonly ToolStripMenuItem _panZoomItem;
         private readonly ToolStripMenuItem _logItem;
+        private readonly ToolStripMenuItem _diagItem;
         private readonly ToolStripMenuItem _autoStartItem;
+        private readonly Timer _diagTimer;
         private readonly Icon _iconOn;
         private readonly Icon _iconOff;
 
@@ -54,6 +56,13 @@ namespace PptFigmaDrag
             _logItem.CheckOnClick = true;
             _logItem.CheckedChanged += OnLogChanged;
 
+            _diagItem = new ToolStripMenuItem("🔍 진단 실행 (3초 후 커서 위치 검사)");
+            _diagItem.Click += OnRunDiagnostics;
+
+            _diagTimer = new Timer();
+            _diagTimer.Interval = 3000;
+            _diagTimer.Tick += OnDiagTimerTick;
+
             _autoStartItem = new ToolStripMenuItem("Windows 시작 시 자동 실행");
             _autoStartItem.Checked = IsAutoStartRegistered();
             _autoStartItem.CheckOnClick = true;
@@ -66,6 +75,7 @@ namespace PptFigmaDrag
             menu.Items.Add(_enabledItem);
             menu.Items.Add(_panZoomItem);
             menu.Items.Add(_logItem);
+            menu.Items.Add(_diagItem);
             menu.Items.Add(_autoStartItem);
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(exitItem);
@@ -114,6 +124,33 @@ namespace PptFigmaDrag
             _enabledItem.Checked = !_enabledItem.Checked;
         }
 
+        // Give the user 3 seconds to move the cursor onto the slide (clicking the
+        // menu moves the pointer to the tray) before sampling the window there.
+        private void OnRunDiagnostics(object sender, EventArgs e)
+        {
+            _notifyIcon.BalloonTipTitle = "PPT Figma Drag 진단";
+            _notifyIcon.BalloonTipText = "3초 안에 마우스를 PowerPoint 슬라이드 위로 옮겨 두세요.";
+            _notifyIcon.ShowBalloonTip(2500);
+            _diagTimer.Stop();
+            _diagTimer.Start();
+        }
+
+        private void OnDiagTimerTick(object sender, EventArgs e)
+        {
+            _diagTimer.Stop();
+            string report;
+            try
+            {
+                report = Diagnostics.Run(_engine);
+            }
+            catch (Exception ex)
+            {
+                report = "진단 중 오류: " + ex;
+            }
+            MessageBox.Show(report, "PPT Figma Drag 진단",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
         private void OnAutoStartChanged(object sender, EventArgs e)
         {
             try
@@ -151,6 +188,8 @@ namespace PptFigmaDrag
         private void OnExit(object sender, EventArgs e)
         {
             _notifyIcon.Visible = false;
+            _diagTimer.Stop();
+            _diagTimer.Dispose();
             _hook.Dispose();
             _engine.Dispose();
             _monitor.Dispose();
