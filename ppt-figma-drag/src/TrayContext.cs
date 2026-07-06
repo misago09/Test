@@ -23,6 +23,7 @@ namespace PptFigmaDrag
         private readonly ToolStripMenuItem _diagItem;
         private readonly ToolStripMenuItem _autoStartItem;
         private readonly Timer _diagTimer;
+        private readonly Timer _hookHealthTimer;
         private readonly Icon _iconOn;
         private readonly Icon _iconOff;
         private volatile bool _diagRunning;
@@ -63,6 +64,14 @@ namespace PptFigmaDrag
             _diagTimer = new Timer();
             _diagTimer.Interval = 3000;
             _diagTimer.Tick += OnDiagTimerTick;
+
+            // Self-healing for the silent low-level-hook removal Windows performs
+            // when a callback ever stalls: without this, one hiccup permanently
+            // reverts every feature to native behavior until app restart.
+            _hookHealthTimer = new Timer();
+            _hookHealthTimer.Interval = 2000;
+            _hookHealthTimer.Tick += OnHookHealthTick;
+            _hookHealthTimer.Start();
 
             _autoStartItem = new ToolStripMenuItem("Windows 시작 시 자동 실행");
             _autoStartItem.Checked = IsAutoStartRegistered();
@@ -211,9 +220,17 @@ namespace PptFigmaDrag
             }
         }
 
+        private void OnHookHealthTick(object sender, EventArgs e)
+        {
+            try { _hook.CheckHealthAndReinstall(); }
+            catch { }
+        }
+
         private void OnExit(object sender, EventArgs e)
         {
             _notifyIcon.Visible = false;
+            _hookHealthTimer.Stop();
+            _hookHealthTimer.Dispose();
             _diagTimer.Stop();
             _diagTimer.Dispose();
             _hook.Dispose();

@@ -236,6 +236,17 @@ namespace PptFigmaDrag
                 if (vs.Valid && vs.SlideIndex > 0 && _guardArmed && _guardSlideIndex == 0)
                     _guardSlideIndex = vs.SlideIndex;
 
+                // Escape detected while the gesture is still running: revert right
+                // away instead of waiting for the end-of-gesture deadline. The
+                // guard stays armed in case the gesture pushes out again.
+                if (_guardArmed && !_guardVerifyPending &&
+                    _guardSlideIndex > 0 && vs.Valid && vs.SlideIndex > 0 &&
+                    vs.SlideIndex != _guardSlideIndex &&
+                    Environment.TickCount - MouseHook.LastLeftClickTick >= 400)
+                {
+                    revertTo = _guardSlideIndex;
+                }
+
                 if (_guardVerifyPending && Environment.TickCount - _guardVerifyAtTick >= 0)
                 {
                     if (!vs.Valid || vs.SlideIndex <= 0)

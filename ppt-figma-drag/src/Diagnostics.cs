@@ -202,6 +202,11 @@ namespace PptFigmaDrag
             r.Append("실행 환경: ").Append(remote ? "원격 세션 ⚠" : "로컬 콘솔").Append("\r\n");
             r.Append("터치 주입 초기화: ").Append(engine.Ready ? "성공 ✓" : "실패 ✗").Append("\r\n\r\n");
 
+            int hookAge = Environment.TickCount - hook.LastEventTick;
+            r.Append("훅 상태: 마지막 이벤트 ").Append(hookAge < 10000 ? (hookAge / 1000.0).ToString("F1", inv) + "초 전" : "오래 전(!)")
+             .Append(", 설치 ").Append(hook.InstallCount).Append("회")
+             .Append(hook.InstallCount > 1 ? "  ← 훅이 죽어 자동 재설치된 적 있음" : "")
+             .Append("\r\n");
             r.Append("훅 처리 횟수(앱 시작 후): ").Append(hook.DiagCounters).Append("\r\n");
             r.Append("마지막 휠 판정: ").Append(hook.LastWheelGate).Append("\r\n");
             r.Append("마지막 가운데버튼 판정: ").Append(hook.LastMiddleGate).Append("\r\n");

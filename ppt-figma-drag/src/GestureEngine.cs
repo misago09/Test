@@ -114,7 +114,46 @@ namespace PptFigmaDrag
         private double _roomPosX, _roomNegX, _roomPosY, _roomNegY;
         private double _wheelInjAtSampleX, _wheelInjAtSampleY;
         private int _roomsSampleTick;
+        private int _wheelStartSlide;
         private int _lastNotchTick;
+
+        // Recent (tick, injected pan) pairs. COM viewport samples lag behind the
+        // injections; pairing a sample with the injected total AT ITS TIME (not
+        // now) is what keeps the clamp exact under rapid scrolling.
+        private const int HistSize = 64;
+        private readonly int[] _histTick = new int[HistSize];
+        private readonly double[] _histX = new double[HistSize];
+        private readonly double[] _histY = new double[HistSize];
+        private int _histCount;
+
+        private void RecordInjectionHistory()
+        {
+            int i = _histCount % HistSize;
+            _histTick[i] = Environment.TickCount;
+            _histX[i] = _wheelInjectedX;
+            _histY[i] = _wheelInjectedY;
+            _histCount++;
+        }
+
+        private void InjectedAt(int tick, out double x, out double y)
+        {
+            x = 0.0;
+            y = 0.0;
+            bool found = false;
+            int bestTick = 0;
+            int count = _histCount < HistSize ? _histCount : HistSize;
+            for (int i = 0; i < count; i++)
+            {
+                if (tick - _histTick[i] >= 0 && (!found || _histTick[i] - bestTick >= 0))
+                {
+                    found = true;
+                    bestTick = _histTick[i];
+                    x = _histX[i];
+                    y = _histY[i];
+                }
+            }
+            // Not found: the sample predates the gesture, when nothing was injected.
+        }
 
         // Pinch
         private double _pinchCenterX, _pinchCenterY;
@@ -452,7 +491,11 @@ namespace PptFigmaDrag
             _wheelTargetY = 0.0;
             _wheelInjectedX = 0.0;
             _wheelInjectedY = 0.0;
+            _histCount = 0;
+            RecordInjectionHistory();
             bool clamped = ComputeWheelRooms(c.CanvasHwnd);
+            ViewportState vsStart = _monitor.Current;
+            _wheelStartSlide = vsStart != null && vsStart.Valid ? vsStart.SlideIndex : 0;
             _wheelGestureCount++;
             _lastRoomsInfo = (clamped ? "클램프 적용" : "뷰포트 확인 실패 → 휠 입력 무시") +
                 " / 위로 " + (int)_roomPosY + "px, 아래로 " + (int)_roomNegY +
@@ -532,19 +575,23 @@ namespace PptFigmaDrag
         // exactly even while more pan lands between samples.
         private void ApplyRooms(ViewportState vs)
         {
-            const double edgeSafetyPx = 3.0;
+            // Vertical overshoot is what flips slides - keep a real safety gap.
+            const double vertSafetyPx = 12.0;
+            // Sideways there is no next slide: allow panning into the gray margin;
+            // PowerPoint clamps to its true scroll extent by itself.
+            const double horizSlackPx = 200.0;
+
             double slideRight = vs.Ox + vs.SlideWpt * vs.Sx;
             double slideBottom = vs.Oy + vs.SlideHpt * vs.Sy;
 
             // Content moving down/right (positive pan) is allowed until the slide
             // top/left edge reaches the canvas top/left edge, and vice versa.
-            _roomPosY = Math.Max(0.0, _wheelRect.Top - vs.Oy - edgeSafetyPx);
-            _roomNegY = Math.Max(0.0, slideBottom - _wheelRect.Bottom - edgeSafetyPx);
-            _roomPosX = Math.Max(0.0, _wheelRect.Left - vs.Ox - edgeSafetyPx);
-            _roomNegX = Math.Max(0.0, slideRight - _wheelRect.Right - edgeSafetyPx);
+            _roomPosY = Math.Max(0.0, _wheelRect.Top - vs.Oy - vertSafetyPx);
+            _roomNegY = Math.Max(0.0, slideBottom - _wheelRect.Bottom - vertSafetyPx);
+            _roomPosX = Math.Max(0.0, _wheelRect.Left - vs.Ox) + horizSlackPx;
+            _roomNegX = Math.Max(0.0, slideRight - _wheelRect.Right) + horizSlackPx;
             _roomsSampleTick = vs.TickMs;
-            _wheelInjAtSampleX = _wheelInjectedX;
-            _wheelInjAtSampleY = _wheelInjectedY;
+            InjectedAt(vs.TickMs, out _wheelInjAtSampleX, out _wheelInjAtSampleY);
         }
 
         private double ClampWheelTargetX(double target)
@@ -635,12 +682,22 @@ namespace PptFigmaDrag
                     // and each fresh sample re-anchors the allowed range, so the pan
                     // cannot cross the slide edge even when notches keep arriving.
                     ViewportState liveVs = _monitor.Current;
-                    if (_wheelRectValid && liveVs != null && liveVs.Valid &&
-                        liveVs.TickMs != _roomsSampleTick)
+                    if (liveVs != null && liveVs.Valid)
                     {
-                        ApplyRooms(liveVs);
-                        _wheelTargetX = ClampWheelTargetX(_wheelTargetX);
-                        _wheelTargetY = ClampWheelTargetY(_wheelTargetY);
+                        if (_wheelStartSlide > 0 && liveVs.SlideIndex > 0 &&
+                            liveVs.SlideIndex != _wheelStartSlide)
+                        {
+                            // Escaped onto another slide despite the clamp: stop
+                            // pushing immediately; the monitor reverts the slide.
+                            _wheelTargetX = _wheelInjectedX;
+                            _wheelTargetY = _wheelInjectedY;
+                        }
+                        else if (_wheelRectValid && liveVs.TickMs != _roomsSampleTick)
+                        {
+                            ApplyRooms(liveVs);
+                            _wheelTargetX = ClampWheelTargetX(_wheelTargetX);
+                            _wheelTargetY = ClampWheelTargetY(_wheelTargetY);
+                        }
                     }
 
                     bool moved = false;
@@ -687,6 +744,7 @@ namespace PptFigmaDrag
                         _wheelContactY = nextY;
                         _wheelInjectedX += stepX;
                         _wheelInjectedY += stepY;
+                        RecordInjectionHistory();
                         moved = true;
                     }
                     if (!moved && Environment.TickCount - _lastNotchTick > GestureIdleEndMs)

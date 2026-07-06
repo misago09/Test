@@ -142,6 +142,18 @@ namespace PptFigmaDrag
         private readonly HookProc _proc; // field keeps the delegate alive against GC
         private readonly StringBuilder _classBuffer = new StringBuilder(128);
         private IntPtr _hook;
+        private volatile int _lastEventTick;
+        private int _installCount;
+
+        public int InstallCount
+        {
+            get { return _installCount; }
+        }
+
+        public int LastEventTick
+        {
+            get { return _lastEventTick; }
+        }
         private volatile bool _enabled = true;
         private volatile bool _panZoomEnabled = true;
         private bool _middleCaptured; // hook thread only
@@ -175,6 +187,41 @@ namespace PptFigmaDrag
             _hook = SetWindowsHookEx(WH_MOUSE_LL, _proc, module, 0);
             if (_hook == IntPtr.Zero)
                 throw new Win32Exception(Marshal.GetLastWin32Error(), "마우스 훅 설치에 실패했습니다.");
+            _installCount++;
+            _lastEventTick = Environment.TickCount;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct LASTINPUTINFO
+        {
+            public uint Size;
+            public uint Time;
+        }
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetLastInputInfo(ref LASTINPUTINFO info);
+
+        // Windows silently removes a low-level hook whose callback ever stalls
+        // past the hook timeout - from then on every feature reverts to native
+        // behavior with no error. Detect "the system saw input but we didn't"
+        // and re-install. Must run on the thread that owns the hook.
+        public void CheckHealthAndReinstall()
+        {
+            if (_hook == IntPtr.Zero)
+                return;
+            LASTINPUTINFO info = new LASTINPUTINFO();
+            info.Size = (uint)Marshal.SizeOf(typeof(LASTINPUTINFO));
+            if (!GetLastInputInfo(ref info))
+                return;
+            int sinceInput = Environment.TickCount - (int)info.Time;
+            int sinceHookEvent = Environment.TickCount - _lastEventTick;
+            if (sinceInput < 500 && sinceHookEvent > 3000)
+            {
+                UnhookWindowsHookEx(_hook);
+                _hook = IntPtr.Zero;
+                Install();
+            }
         }
 
         private static bool IsSynthesized(ref MSLLHOOKSTRUCT data)
@@ -243,6 +290,7 @@ namespace PptFigmaDrag
         {
             if (nCode >= 0)
             {
+                _lastEventTick = Environment.TickCount; // hook liveness marker
                 long msg = wParam.ToInt64();
 
                 if (msg == WM_MOUSEMOVE)
