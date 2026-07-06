@@ -38,7 +38,7 @@ namespace PptFigmaDrag
             PanEnd,
             Wheel,
             Pinch,
-            SelfTest
+            Probe
         }
 
         private struct Cmd
@@ -115,6 +115,27 @@ namespace PptFigmaDrag
         // Pinch
         private double _pinchCenterX, _pinchCenterY;
         private double _pinchHalf, _pinchTargetHalf;
+        private double _pinchStartHalf = PinchStartHalfPx;
+        private double _pinchCursorX, _pinchCursorY; // the point the zoom should anchor to
+        private double _pinchViewCenterX, _pinchViewCenterY; // where PowerPoint actually anchors
+        private bool _pinchCompensate;
+        private RECT _pinchRect;
+        private bool _pinchRectValid;
+        private IntPtr _pinchCanvasHwnd;
+
+        // Diagnostics
+        private volatile string _lastRoomsInfo = "(아직 휠 제스처 없음)";
+        private int _wheelGestureCount;
+
+        public string LastRoomsInfo
+        {
+            get { return _lastRoomsInfo; }
+        }
+
+        public int WheelGestureCount
+        {
+            get { return _wheelGestureCount; }
+        }
 
         public GestureEngine(ViewportMonitor monitor)
         {
@@ -150,22 +171,31 @@ namespace PptFigmaDrag
             get { return _probeReport; }
         }
 
-        // Diagnostic: on the engine thread, inject a visible two-finger pinch-zoom
-        // at (x,y) and report whether every InjectTouchInput call succeeded.
-        //  -1 = engine never became Ready (touch injection unavailable)
-        //   0 = injection API call failed (permission / UIPI / bad coords)
-        //   1 = all injection calls returned success
-        public int RunSelfTest(int x, int y)
+        public const int ProbeKindPan2 = 0;  // two-finger parallel drag, amount = dx px
+        public const int ProbeKindPan1 = 1;  // single-finger drag, amount = dx px
+        public const int ProbeKindPinch = 2; // pinch, amount = spread factor (e.g. 1.5)
+
+        // Diagnostic: inject one gesture on the engine thread and return whether
+        // every InjectTouchInput call succeeded. The caller measures the actual
+        // viewport reaction over COM before/after.
+        public bool RunProbe(int kind, int x, int y, double amount)
         {
             if (!_ready)
-                return -1;
+                return false;
+            while (_selfTestDone.WaitOne(0))
+            {
+                // drain a signal left over from a previously timed-out probe
+            }
             Cmd c = new Cmd();
-            c.Kind = CmdKind.SelfTest;
+            c.Kind = CmdKind.Probe;
             c.X = x;
             c.Y = y;
+            c.Dx = kind;
+            c.Dy = amount;
             Post(c);
-            _selfTestDone.WaitOne(2000);
-            return _selfTestOk ? 1 : 0;
+            if (!_selfTestDone.WaitOne(4000))
+                return false; // engine wedged: don't report a stale result
+            return _selfTestOk;
         }
 
         #region hook-side entry points (must stay cheap)
@@ -273,27 +303,25 @@ namespace PptFigmaDrag
         {
             switch (c.Kind)
             {
-                case CmdKind.SelfTest:
+                case CmdKind.Probe:
                 {
                     if (_state != GState.Idle)
                         FinishGesture();
-                    // Visible pinch-zoom-in around the cursor: always shows if
-                    // PowerPoint accepts injected touch, regardless of scroll room.
-                    bool ok = true;
-                    int half = 40;
-                    ok = _injector.Down(c.X - half, c.Y, c.X + half, c.Y);
-                    for (int i = 0; i < 12 && ok; i++)
+                    int kind = (int)c.Dx;
+                    bool ok;
+                    if (kind == ProbeKindPinch)
                     {
-                        half += 9;
-                        ok = _injector.Move(c.X - half, c.Y, c.X + half, c.Y);
-                        Thread.Sleep(FrameMs * 2);
+                        int half1 = (int)Math.Round(55.0 * c.Dy);
+                        ok = _injector.ProbePinch(c.X, c.Y, 55, half1, 12, FrameMs * 2);
                     }
-                    _injector.Hold();
-                    Thread.Sleep(FrameMs);
-                    bool up = _injector.Up();
-                    _selfTestOk = ok && up;
+                    else
+                    {
+                        int contacts = kind == ProbeKindPan2 ? 2 : 1;
+                        ok = _injector.ProbeDrag(contacts, c.X, c.Y, (int)c.Dy, 10, FrameMs * 2);
+                    }
+                    _selfTestOk = ok;
                     // On failure, probe parameter variants to find what Windows rejects.
-                    _probeReport = _selfTestOk ? null : _injector.ProbeAll(c.X, c.Y);
+                    _probeReport = ok ? null : _injector.ProbeAll(c.X, c.Y);
                     _selfTestDone.Set();
                     break;
                 }
@@ -357,6 +385,19 @@ namespace PptFigmaDrag
                 case CmdKind.Pinch:
                     if (_state == GState.MousePan)
                         break;
+                    // At PowerPoint's zoom limits (400% / 10%) a pinch delivers no
+                    // scale change, so the anchor compensation would degenerate into
+                    // a pure sideways drift - drop the notch entirely.
+                    {
+                        ViewportState vsNow = _monitor.Current;
+                        if (vsNow != null && vsNow.Valid && vsNow.ZoomPercent > 0 &&
+                            Environment.TickCount - vsNow.TickMs < 1500)
+                        {
+                            if ((c.Dx > 1.0 && vsNow.ZoomPercent >= 400) ||
+                                (c.Dx < 1.0 && vsNow.ZoomPercent <= 10))
+                                break;
+                        }
+                    }
                     if (_state == GState.WheelPan)
                         FinishGesture();
                     if (_state == GState.Idle)
@@ -367,6 +408,22 @@ namespace PptFigmaDrag
                         _pinchCenterY = cy;
                         _pinchHalf = PinchStartHalfPx;
                         _pinchTargetHalf = PinchStartHalfPx;
+                        _pinchStartHalf = PinchStartHalfPx;
+                        // PowerPoint's canvas zooms about the viewport centre, not
+                        // the finger centroid. To anchor at the cursor we pan the
+                        // fingers while pinching, by (cursor-centre)*(1-f).
+                        _pinchCursorX = c.X;
+                        _pinchCursorY = c.Y;
+                        _pinchCompensate = false;
+                        _pinchCanvasHwnd = c.CanvasHwnd;
+                        _pinchRectValid = c.CanvasHwnd != IntPtr.Zero &&
+                                          GetWindowRect(c.CanvasHwnd, out _pinchRect);
+                        if (_pinchRectValid)
+                        {
+                            _pinchViewCenterX = (_pinchRect.Left + _pinchRect.Right) / 2.0;
+                            _pinchViewCenterY = (_pinchRect.Top + _pinchRect.Bottom) / 2.0;
+                            _pinchCompensate = true;
+                        }
                         if (!_injector.Down((int)Math.Round(_pinchCenterX - _pinchHalf), cy,
                                             (int)Math.Round(_pinchCenterX + _pinchHalf), cy))
                             break;
@@ -398,6 +455,10 @@ namespace PptFigmaDrag
         private bool BeginWheelGesture(Cmd c)
         {
             bool clamped = ComputeWheelRooms(c.CanvasHwnd);
+            _wheelGestureCount++;
+            _lastRoomsInfo = (clamped ? "클램프 적용" : "클램프 없음(뷰포트 샘플 실패)") +
+                " / 위로 " + (int)_roomPosY + "px, 아래로 " + (int)_roomNegY +
+                "px, 왼쪽 " + (int)_roomPosX + "px, 오른쪽 " + (int)_roomNegX + "px";
             _wheelTargetX = 0.0;
             _wheelTargetY = 0.0;
             _wheelInjectedX = 0.0;
@@ -599,14 +660,65 @@ namespace PptFigmaDrag
                     bool moved = false;
                     if (_pinchHalf != _pinchTargetHalf)
                     {
+                        double prevHalf = _pinchHalf;
                         _pinchHalf = StepToward(_pinchHalf, _pinchTargetHalf, MaxPinchStepPx);
-                        if (!_injector.Move((int)Math.Round(_pinchCenterX - _pinchHalf), (int)Math.Round(_pinchCenterY),
-                                            (int)Math.Round(_pinchCenterX + _pinchHalf), (int)Math.Round(_pinchCenterY)))
+                        // PowerPoint zooms about the viewport centre; translating the
+                        // fingers by (cursor-centre)*(1-f) while pinching drags the
+                        // zoomed content back so the cursor point stays put.
+                        double cx = _pinchCenterX;
+                        double cy = _pinchCenterY;
+                        if (_pinchCompensate && _pinchStartHalf > 0.0)
+                        {
+                            double f = _pinchHalf / _pinchStartHalf;
+                            cx += (_pinchCursorX - _pinchViewCenterX) * (1.0 - f);
+                            cy += (_pinchCursorY - _pinchViewCenterY) * (1.0 - f);
+                        }
+
+                        // The compensation offset grows without bound; if the pair is
+                        // about to leave the canvas (where the virtual-screen clamp
+                        // would silently truncate the pan and break the anchor), lift
+                        // and restart a fresh leg at the cursor with the residual zoom.
+                        if (_pinchRectValid &&
+                            (cx - _pinchHalf < _pinchRect.Left + CanvasEdgeInsetPx ||
+                             cx + _pinchHalf > _pinchRect.Right - CanvasEdgeInsetPx ||
+                             cy < _pinchRect.Top + CanvasEdgeInsetPx ||
+                             cy > _pinchRect.Bottom - CanvasEdgeInsetPx))
+                        {
+                            double remaining = prevHalf > 0.0 ? _pinchTargetHalf / prevHalf : 1.0;
+                            _injector.Hold();
+                            Thread.Sleep(FrameMs);
+                            _injector.Hold();
+                            _injector.Up();
+
+                            int ncx = (int)Math.Round(_pinchCursorX);
+                            int ncy = (int)Math.Round(_pinchCursorY);
+                            ClampContactCenter(_pinchCanvasHwnd, PinchStartHalfPx, ref ncx, ref ncy);
+                            _pinchCenterX = ncx;
+                            _pinchCenterY = ncy;
+                            _pinchHalf = PinchStartHalfPx;
+                            _pinchStartHalf = PinchStartHalfPx;
+                            double newTarget = PinchStartHalfPx * remaining;
+                            if (newTarget < PinchMinHalfPx) newTarget = PinchMinHalfPx;
+                            if (newTarget > PinchMaxHalfPx) newTarget = PinchMaxHalfPx;
+                            _pinchTargetHalf = newTarget;
+
+                            if (!_injector.Down(ncx - PinchStartHalfPx, ncy, ncx + PinchStartHalfPx, ncy))
+                            {
+                                AbortGesture();
+                                break;
+                            }
+                            moved = true; // fresh leg continues next tick
+                        }
+                        else if (!_injector.Move((int)Math.Round(cx - _pinchHalf), (int)Math.Round(cy),
+                                                 (int)Math.Round(cx + _pinchHalf), (int)Math.Round(cy)))
                         {
                             AbortGesture();
                             break;
                         }
-                        moved = true;
+                        else
+                        {
+                            moved = true;
+                        }
                     }
                     if (!moved && Environment.TickCount - _lastNotchTick > GestureIdleEndMs)
                         FinishGesture();

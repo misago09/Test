@@ -231,6 +231,106 @@ namespace PptFigmaDrag
             InjectTouchInput(2, _frame);
         }
 
+        private bool InjectProbe(uint count, POINTER_TOUCH_INFO[] frame)
+        {
+            if (InjectTouchInput(count, frame))
+                return true;
+            LastError = Marshal.GetLastWin32Error();
+            return false;
+        }
+
+        // Positions are clamped as a PAIR so a probe near a screen edge neither
+        // fails outright nor turns a drag into an accidental pinch.
+        private static void FillProbeFrame(POINTER_TOUCH_INFO[] frame, int contacts,
+            int x, int y, int dx, uint flags, uint mask)
+        {
+            int spread = contacts == 2 ? 24 : 0;
+            int x0 = x + dx - spread;
+            int x1 = x + dx + spread;
+            int y0 = y, y1 = y;
+            ClampPairToVirtualScreen(ref x0, ref y0, ref x1, ref y1);
+            frame[0] = MakeContact(0, x0, y0, flags, mask);
+            if (contacts == 2)
+                frame[1] = MakeContact(1, x1, y1, flags, mask);
+        }
+
+        private static void FillPinchFrame(POINTER_TOUCH_INFO[] frame,
+            int x, int y, int half, uint flags, uint mask)
+        {
+            int x0 = x - half;
+            int x1 = x + half;
+            int y0 = y, y1 = y;
+            ClampPairToVirtualScreen(ref x0, ref y0, ref x1, ref y1);
+            frame[0] = MakeContact(0, x0, y0, flags, mask);
+            frame[1] = MakeContact(1, x1, y1, flags, mask);
+        }
+
+        // Diagnostic: press 1 or 2 fingers at (x,y), drag them horizontally by
+        // dxTotal, settle, lift. Local frames only - never touches gesture state.
+        public bool ProbeDrag(int contacts, int x, int y, int dxTotal, int frames, int frameMs)
+        {
+            uint mask = TOUCH_MASK_CONTACTAREA | TOUCH_MASK_ORIENTATION | TOUCH_MASK_PRESSURE;
+            uint down = POINTER_FLAG_DOWN | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT;
+            uint update = POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT;
+            POINTER_TOUCH_INFO[] frame = new POINTER_TOUCH_INFO[contacts];
+
+            FillProbeFrame(frame, contacts, x, y, 0, down, mask);
+            if (!InjectProbe((uint)contacts, frame))
+                return false; // nothing went down; keep the DOWN's error code intact
+
+            bool ok = true;
+            int moved = 0;
+            for (int i = 1; i <= frames && ok; i++)
+            {
+                moved = dxTotal * i / frames;
+                FillProbeFrame(frame, contacts, x, y, moved, update, mask);
+                ok = InjectProbe((uint)contacts, frame);
+                System.Threading.Thread.Sleep(frameMs);
+            }
+            for (int i = 0; i < 3; i++) // anti-inertia settle
+            {
+                FillProbeFrame(frame, contacts, x, y, moved, update, mask);
+                InjectProbe((uint)contacts, frame);
+                System.Threading.Thread.Sleep(frameMs);
+            }
+            FillProbeFrame(frame, contacts, x, y, moved, POINTER_FLAG_UP, mask);
+            InjectProbe((uint)contacts, frame);
+            return ok;
+        }
+
+        // Diagnostic: two fingers spreading from half0 to half1 around a FIXED
+        // centroid - measures PowerPoint's raw zoom anchor without compensation.
+        public bool ProbePinch(int x, int y, int half0, int half1, int frames, int frameMs)
+        {
+            uint mask = TOUCH_MASK_CONTACTAREA | TOUCH_MASK_ORIENTATION | TOUCH_MASK_PRESSURE;
+            uint down = POINTER_FLAG_DOWN | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT;
+            uint update = POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT;
+            POINTER_TOUCH_INFO[] frame = new POINTER_TOUCH_INFO[2];
+
+            int half = half0;
+            FillPinchFrame(frame, x, y, half, down, mask);
+            if (!InjectProbe(2, frame))
+                return false; // nothing went down; keep the DOWN's error code intact
+
+            bool ok = true;
+            for (int i = 1; i <= frames && ok; i++)
+            {
+                half = half0 + (half1 - half0) * i / frames;
+                FillPinchFrame(frame, x, y, half, update, mask);
+                ok = InjectProbe(2, frame);
+                System.Threading.Thread.Sleep(frameMs);
+            }
+            for (int i = 0; i < 3; i++)
+            {
+                FillPinchFrame(frame, x, y, half, update, mask);
+                InjectProbe(2, frame);
+                System.Threading.Thread.Sleep(frameMs);
+            }
+            FillPinchFrame(frame, x, y, half, POINTER_FLAG_UP, mask);
+            InjectProbe(2, frame);
+            return ok;
+        }
+
         // Diagnostic: try several parameter variants of a DOWN+UP at (x,y) and
         // report which succeed. Whichever variant works pinpoints the field that
         // Windows was rejecting with ERROR_INVALID_PARAMETER.

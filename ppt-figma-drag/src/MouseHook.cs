@@ -110,6 +110,33 @@ namespace PptFigmaDrag
         // The slide guard uses it to avoid reverting deliberate user navigation.
         public static volatile int LastLeftClickTick;
 
+        // Diagnostic gate trace: why the last wheel / middle-button event was or
+        // was not taken over. Written on the hook thread, read by the diagnostic.
+        private volatile int _cntWheelPan;
+        private volatile int _cntWheelPinch;
+        private volatile int _cntMiddle;
+        private volatile string _lastWheelGate = "(휠 이벤트 없음)";
+        private volatile string _lastMiddleGate = "(가운데 버튼 이벤트 없음)";
+
+        public string DiagCounters
+        {
+            get
+            {
+                return "휠→팬 " + _cntWheelPan + "회, Ctrl+휠→줌 " + _cntWheelPinch +
+                       "회, 가운데 드래그 " + _cntMiddle + "회";
+            }
+        }
+
+        public string LastWheelGate
+        {
+            get { return _lastWheelGate; }
+        }
+
+        public string LastMiddleGate
+        {
+            get { return _lastMiddleGate; }
+        }
+
         private readonly DragWorker _worker;
         private readonly GestureEngine _engine;
         private readonly HookProc _proc; // field keeps the delegate alive against GC
@@ -255,12 +282,22 @@ namespace PptFigmaDrag
                     if (_middleCaptured && _engine != null && !_engine.MousePanActive)
                         _middleCaptured = false;
 
-                    if (_panZoomEnabled && _engine != null && _engine.Ready)
+                    if (!_panZoomEnabled)
+                        _lastMiddleGate = "통과: 이동/확대 기능 꺼짐";
+                    else if (_engine == null || !_engine.Ready)
+                        _lastMiddleGate = "통과: 터치 주입 준비 안 됨";
+                    else
                     {
                         MSLLHOOKSTRUCT data = (MSLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(MSLLHOOKSTRUCT));
                         IntPtr canvas;
-                        if (!IsSynthesized(ref data) && IsOnPptCanvas(data.PtX, data.PtY, out canvas))
+                        if (IsSynthesized(ref data))
+                            _lastMiddleGate = "통과: 합성 이벤트";
+                        else if (!IsOnPptCanvas(data.PtX, data.PtY, out canvas))
+                            _lastMiddleGate = "통과: PPT 캔버스 아님";
+                        else
                         {
+                            _lastMiddleGate = "소비: 팬 시작";
+                            _cntMiddle++;
                             _middleCaptured = true;
                             _engine.StartMousePan(data.PtX, data.PtY, canvas);
                             return (IntPtr)1; // PowerPoint never sees this middle-drag
@@ -293,16 +330,28 @@ namespace PptFigmaDrag
                     {
                         IntPtr fgRoot = GetForegroundWindow();
                         if (ClassNameIs(fgRoot, PptFrameClass))
+                        {
+                            _lastWheelGate = "소비: 가운데 드래그 중 휠 차단";
                             return (IntPtr)1;
+                        }
                     }
-                    else if (_panZoomEnabled && _engine != null && _engine.Ready)
+                    else if (!_panZoomEnabled)
+                        _lastWheelGate = "통과: 이동/확대 기능 꺼짐";
+                    else if (_engine == null || !_engine.Ready)
+                        _lastWheelGate = "통과: 터치 주입 준비 안 됨";
+                    else
                     {
                         MSLLHOOKSTRUCT data = (MSLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(MSLLHOOKSTRUCT));
                         IntPtr canvas;
-                        if (!IsTouchSynthesized(ref data) &&
-                            (GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0 && // not during a left-drag (marquee/move)
-                            IsOnPptCanvas(data.PtX, data.PtY, out canvas) &&
-                            GetForegroundWindow() == GetAncestor(canvas, GA_ROOT)) // background wheel must not steal focus
+                        if (IsTouchSynthesized(ref data))
+                            _lastWheelGate = "통과: 터치 합성 이벤트";
+                        else if ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0)
+                            _lastWheelGate = "통과: 왼쪽 버튼 드래그 중";
+                        else if (!IsOnPptCanvas(data.PtX, data.PtY, out canvas))
+                            _lastWheelGate = "통과: PPT 캔버스 아님";
+                        else if (GetForegroundWindow() != GetAncestor(canvas, GA_ROOT))
+                            _lastWheelGate = "통과: PPT가 활성 창 아님";
+                        else
                         {
                             int delta = WheelDelta(data.MouseData);
                             bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
@@ -311,6 +360,8 @@ namespace PptFigmaDrag
                             if (msg == WM_MOUSEWHEEL && ctrl)
                             {
                                 // Figma-style zoom around the cursor.
+                                _lastWheelGate = "소비: Ctrl+휠 → 커서 기준 줌";
+                                _cntWheelPinch++;
                                 _engine.AddPinchZoom(GestureEngine.WheelNotchesToZoomFactor(delta),
                                     data.PtX, data.PtY, canvas);
                             }
@@ -318,6 +369,8 @@ namespace PptFigmaDrag
                             {
                                 // Smooth pan instead of line scrolling; clamped by the
                                 // engine so the view never jumps to another slide.
+                                _lastWheelGate = "소비: 휠 → 팬";
+                                _cntWheelPan++;
                                 double pan = GestureEngine.WheelNotchesToPanPx(delta);
                                 double dx = 0.0, dy = 0.0;
                                 if (msg == WM_MOUSEHWHEEL)

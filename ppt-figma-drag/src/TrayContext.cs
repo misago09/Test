@@ -25,6 +25,7 @@ namespace PptFigmaDrag
         private readonly Timer _diagTimer;
         private readonly Icon _iconOn;
         private readonly Icon _iconOff;
+        private volatile bool _diagRunning;
 
         [DllImport("user32.dll")]
         [return: MarshalAs(UnmanagedType.Bool)]
@@ -135,17 +136,36 @@ namespace PptFigmaDrag
             _diagTimer.Start();
         }
 
+        // The measurement takes seconds and must NOT run on this thread: it is
+        // the thread the WH_MOUSE_LL hook lives on, and a blocked hook thread
+        // stutters the system pointer until Windows silently removes the hook.
         private void OnDiagTimerTick(object sender, EventArgs e)
         {
             _diagTimer.Stop();
+            if (_diagRunning)
+                return;
+            _diagRunning = true;
+            System.Threading.Thread worker = new System.Threading.Thread(RunDiagnosticsWorker);
+            worker.SetApartmentState(System.Threading.ApartmentState.STA);
+            worker.IsBackground = true;
+            worker.Name = "PptFigmaDrag.Diag";
+            worker.Start();
+        }
+
+        private void RunDiagnosticsWorker()
+        {
             string report;
             try
             {
-                report = Diagnostics.Run(_engine);
+                report = Diagnostics.Run(_engine, _hook);
             }
             catch (Exception ex)
             {
                 report = "진단 중 오류: " + ex;
+            }
+            finally
+            {
+                _diagRunning = false;
             }
             MessageBox.Show(report, "PPT Figma Drag 진단",
                 MessageBoxButtons.OK, MessageBoxIcon.Information);

@@ -500,6 +500,25 @@ namespace PptFigmaDrag
             }
         }
 
+        // Used by the diagnostic to force a zoom level where the slide overflows
+        // the canvas, so pan probes have somewhere to move.
+        public bool TrySetZoom(int percent)
+        {
+            dynamic app = GetApp();
+            if (app == null)
+                return false;
+            try
+            {
+                app.ActiveWindow.View.Zoom = percent;
+                return true;
+            }
+            catch
+            {
+                InvalidateIfDead();
+                return false;
+            }
+        }
+
         public bool TryGotoSlide(int slideIndex)
         {
             dynamic app = GetApp();

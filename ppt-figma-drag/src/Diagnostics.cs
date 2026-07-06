@@ -1,14 +1,16 @@
 using System;
+using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 
 namespace PptFigmaDrag
 {
-    // One-shot self-diagnosis, shown to the user as a copyable message box. Its
-    // whole purpose is to reveal, on the user's real machine, which of the two
-    // unverified assumptions behind pan/zoom is failing:
-    //   1. that the slide canvas window class is "mdiClass", and
-    //   2. that PowerPoint's edit canvas reacts to injected two-finger touch.
+    // One-shot self-diagnosis shown as a copyable message box. v2 measures the
+    // viewport over COM before/after each injected gesture, so recognition of
+    // pan/pinch and the real zoom anchor are established with numbers instead of
+    // the user's eyes. It temporarily forces 200% zoom so pan probes always have
+    // somewhere to move, and restores everything afterwards.
     internal static class Diagnostics
     {
         [StructLayout(LayoutKind.Sequential)]
@@ -16,6 +18,27 @@ namespace PptFigmaDrag
         {
             public int X;
             public int Y;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct RECT
+        {
+            public int Left;
+            public int Top;
+            public int Right;
+            public int Bottom;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct SCROLLINFO
+        {
+            public uint Size;
+            public uint Mask;
+            public int Min;
+            public int Max;
+            public uint Page;
+            public int Pos;
+            public int TrackPos;
         }
 
         [DllImport("user32.dll")]
@@ -41,10 +64,35 @@ namespace PptFigmaDrag
         [DllImport("user32.dll")]
         private static extern int GetSystemMetrics(int index);
 
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern IntPtr SendMessageTimeout(IntPtr hwnd, uint msg, IntPtr wParam,
+            IntPtr lParam, uint flags, uint timeout, out IntPtr result);
+
         private const int SM_REMOTESESSION = 0x1000;
         private const uint GA_ROOT = 2;
+        private const uint WM_VSCROLL = 0x0115;
+        private const int SB_LINEUP = 0;
+        private const int SB_LINEDOWN = 1;
+        private const uint SMTO_ABORTIFHUNG = 2;
         private const string PptFrameClass = "PPTFrameClass";
         private const string SlideCanvasClass = "mdiClass";
+
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetScrollInfo(IntPtr hwnd, int bar, ref SCROLLINFO si);
+
+        private const int SB_VERT = 1;
+        private const uint SIF_ALL = 0x17;
+
+        private sealed class Vp
+        {
+            public double Ox, Oy, Sx, Sy;
+            public int Zoom;
+        }
 
         private static string ClassOf(IntPtr hwnd)
         {
@@ -56,128 +104,257 @@ namespace PptFigmaDrag
             return sb.ToString();
         }
 
-        private static string ErrorName(int err)
+        private static Vp ReadVp(PowerPointSession session)
         {
-            switch (err)
+            for (int attempt = 0; attempt < 3; attempt++)
             {
-                case 0: return "(성공/미기록)";
-                case 5: return "ERROR_ACCESS_DENIED";
-                case 50: return "ERROR_NOT_SUPPORTED";
-                case 87: return "ERROR_INVALID_PARAMETER";
-                case 1359: return "ERROR_INTERNAL_ERROR";
-                case 0x578: return "ERROR_INVALID_WINDOW_HANDLE";
-                default: return "";
+                double ox, oy, sx, sy, w, h;
+                int zoom, slide;
+                if (session.TryGetViewport(out ox, out oy, out sx, out sy, out w, out h,
+                        out zoom, out slide))
+                {
+                    Vp v = new Vp();
+                    v.Ox = ox;
+                    v.Oy = oy;
+                    v.Sx = sx;
+                    v.Sy = sy;
+                    v.Zoom = zoom;
+                    return v;
+                }
+                Thread.Sleep(120);
             }
+            return null;
         }
 
-        private static string ExplainError(int err, bool remote)
+        private static double Dist(double ax, double ay, double bx, double by)
         {
-            switch (err)
-            {
-                case 5:
-                    return "권한 문제입니다. PowerPoint가 '관리자 권한'으로 실행 중이면,\r\n" +
-                           "   PptFigmaDrag.exe도 우클릭 → 관리자 권한으로 실행하세요 (둘의 권한을 맞춰야 함).";
-                case 50:
-                    return remote
-                        ? "이 RDP/원격 세션은 터치 주입을 지원하지 않습니다.\r\n" +
-                          "   → 터치 대신 COM 기반 방식으로 재구현이 필요합니다(알려주시면 진행)."
-                        : "이 환경/SKU가 터치 주입을 지원하지 않습니다(가상머신·일부 정책).\r\n" +
-                          "   → 터치 대신 COM 기반 방식으로 재구현이 필요합니다(알려주시면 진행).";
-                case 87:
-                    return "좌표 또는 주입 구조체 문제입니다. 개발자에게 이 코드를 알려주시면\r\n" +
-                           "   해당 부분을 정확히 수정하겠습니다.";
-                default:
-                    return remote
-                        ? "원격 세션일 가능성이 큽니다. 이 코드를 개발자에게 알려주세요."
-                        : "이 코드를 개발자에게 알려주시면 원인을 특정해 수정하겠습니다.";
-            }
+            double dx = ax - bx, dy = ay - by;
+            return Math.Sqrt(dx * dx + dy * dy);
         }
 
-        public static string Run(GestureEngine engine)
+        public static string Run(GestureEngine engine, MouseHook hook)
         {
+            CultureInfo inv = CultureInfo.InvariantCulture;
             StringBuilder r = new StringBuilder();
-            r.Append("=== PPT Figma Drag 진단 ===\r\n");
+            r.Append("=== PPT Figma Drag 진단 v2 (자동 측정) ===\r\n");
             r.Append("OS 버전: ").Append(Environment.OSVersion.Version.ToString())
-             .Append(Environment.Is64BitProcess ? "  (64-bit 프로세스)" : "  (32-bit 프로세스)")
-             .Append("\r\n");
+             .Append(Environment.Is64BitProcess ? "  (64-bit)" : "  (32-bit)").Append("\r\n");
             bool remote = GetSystemMetrics(SM_REMOTESESSION) != 0;
-            r.Append("실행 환경: ")
-             .Append(remote ? "원격 데스크톱/RDP 세션 ⚠ (터치 주입이 막히는 대표 환경)" : "로컬 콘솔")
-             .Append("\r\n");
-            r.Append("터치 주입 초기화(Ready): ")
-             .Append(engine.Ready ? "성공 ✓" : "실패 ✗  ← 이 PC/세션에서 InjectTouchInput 사용 불가")
-             .Append("\r\n\r\n");
+            r.Append("실행 환경: ").Append(remote ? "원격 세션 ⚠" : "로컬 콘솔").Append("\r\n");
+            r.Append("터치 주입 초기화: ").Append(engine.Ready ? "성공 ✓" : "실패 ✗").Append("\r\n\r\n");
+
+            r.Append("훅 처리 횟수(앱 시작 후): ").Append(hook.DiagCounters).Append("\r\n");
+            r.Append("마지막 휠 판정: ").Append(hook.LastWheelGate).Append("\r\n");
+            r.Append("마지막 가운데버튼 판정: ").Append(hook.LastMiddleGate).Append("\r\n");
+            r.Append("마지막 휠 제스처 이동 가능량: ").Append(engine.LastRoomsInfo).Append("\r\n\r\n");
 
             POINT p;
             GetCursorPos(out p);
             r.Append("마우스 위치: (").Append(p.X).Append(", ").Append(p.Y).Append(")\r\n");
 
             IntPtr leaf = WindowFromPoint(p);
-            IntPtr root = GetAncestor(leaf, GA_ROOT);
-            string rootClass = ClassOf(root);
-            bool rootIsPpt = string.Equals(rootClass, PptFrameClass, StringComparison.OrdinalIgnoreCase);
-
-            r.Append("커서 아래 창 클래스 계층 (아래→위):\r\n");
-            IntPtr cur = leaf;
-            bool foundCanvas = false;
-            for (int i = 0; i < 12 && cur != IntPtr.Zero; i++)
+            IntPtr canvasHwnd = IntPtr.Zero;
+            IntPtr walker = leaf;
+            for (int i = 0; i < 8 && walker != IntPtr.Zero; i++)
             {
-                string cn = ClassOf(cur);
-                bool isCanvas = string.Equals(cn, SlideCanvasClass, StringComparison.OrdinalIgnoreCase);
-                if (isCanvas)
-                    foundCanvas = true;
-                r.Append("   ").Append(i == 0 ? "[커서] " : "  ↑   ").Append(cn);
-                if (isCanvas)
-                    r.Append("   ← 캔버스로 인식");
-                r.Append("\r\n");
-                cur = GetParent(cur);
-            }
-            r.Append("최상위 창: ").Append(rootClass)
-             .Append(rootIsPpt ? "  ✓ PowerPoint" : "  ✗ PowerPoint 아님").Append("\r\n\r\n");
-
-            bool canvasDetected = foundCanvas && rootIsPpt;
-            r.Append("→ 이 위치에서 팬/줌 동작 조건(캔버스 인식): ")
-             .Append(canvasDetected ? "충족 ✓" : "불충족 ✗").Append("\r\n");
-            if (!canvasDetected)
-            {
-                if (!rootIsPpt)
-                    r.Append("   마우스가 PowerPoint 편집창 위에 있지 않습니다.\r\n" +
-                             "   슬라이드 중앙에 커서를 두고 다시 실행하세요.\r\n");
-                else if (!foundCanvas)
-                    r.Append("   PowerPoint는 맞지만 캔버스 클래스 'mdiClass'를 찾지 못했습니다.\r\n" +
-                             "   → 위 계층에 보이는 실제 클래스명을 개발자에게 알려주세요.\r\n");
-            }
-            r.Append("\r\n");
-
-            // Live injection test. Focus PowerPoint first so the synthetic touch
-            // is routed to it rather than whatever else holds the foreground.
-            if (rootIsPpt)
-                SetForegroundWindow(root);
-            int test = engine.RunSelfTest(p.X, p.Y);
-            r.Append("실시간 터치 주입 테스트: ");
-            if (test < 0)
-                r.Append("건너뜀 (터치 주입 초기화 실패)\r\n");
-            else if (test == 0)
-            {
-                int err = engine.LastInjectError;
-                r.Append("InjectTouchInput 호출 실패 ✗   (GetLastError = ").Append(err)
-                 .Append(" ").Append(ErrorName(err)).Append(")\r\n");
-                r.Append("   ").Append(ExplainError(err, remote)).Append("\r\n");
-                string probe = engine.LastProbeReport;
-                if (probe != null)
+                if (string.Equals(ClassOf(walker), SlideCanvasClass, StringComparison.OrdinalIgnoreCase))
                 {
-                    r.Append("\r\n파라미터 프로브 (성공하는 변형을 찾습니다):\r\n");
-                    r.Append(probe).Append("\r\n");
+                    canvasHwnd = walker;
+                    break;
                 }
+                walker = GetParent(walker);
             }
-            else
-                r.Append("InjectTouchInput 호출 성공 ✓\r\n" +
-                         "   방금 슬라이드가 커서 기준으로 확대됐나요?\r\n" +
-                         "   • 확대됨 → 주입은 정상. 남은 건 게이팅/좌표 문제입니다.\r\n" +
-                         "   • 그대로 → PowerPoint가 합성 터치를 제스처로 받지 않습니다(핵심 원인).\r\n");
+            IntPtr root = GetAncestor(leaf, GA_ROOT);
+            bool rootIsPpt = string.Equals(ClassOf(root), PptFrameClass, StringComparison.OrdinalIgnoreCase);
+            r.Append("캔버스 인식: ").Append(canvasHwnd != IntPtr.Zero && rootIsPpt ? "충족 ✓" : "불충족 ✗")
+             .Append("  (커서 아래: ").Append(ClassOf(leaf)).Append(" / 최상위: ").Append(ClassOf(root)).Append(")\r\n");
+
+            if (!engine.Ready)
+            {
+                r.Append("\r\n터치 주입이 불가능한 환경입니다. 자동 측정을 건너뜁니다.\r\n");
+                return r.ToString();
+            }
+            if (canvasHwnd == IntPtr.Zero || !rootIsPpt)
+            {
+                r.Append("\r\n마우스를 PowerPoint 슬라이드 중앙에 두고 다시 실행하세요.\r\n");
+                return r.ToString();
+            }
+
+            SetForegroundWindow(root);
+            Thread.Sleep(200);
+
+            r.Append("\r\n=== 자동 측정 (화면이 몇 초간 움직이는 것은 정상입니다) ===\r\n");
+            PowerPointSession session = new PowerPointSession();
+            Vp v0 = ReadVp(session);
+            if (v0 == null)
+            {
+                r.Append("PowerPoint 뷰포트를 읽지 못해 자동 측정을 건너뜁니다.\r\n");
+                return r.ToString();
+            }
+            r.Append("현재 배율: ").Append(v0.Zoom).Append("% → 측정 위해 임시로 200% 설정\r\n");
+
+            // v0.Zoom can be 0 when the Zoom read failed; never "restore" to 0%.
+            int zoom0 = v0.Zoom;
+            bool zoomForced = zoom0 > 0 && session.TrySetZoom(200);
+            if (zoomForced)
+                Thread.Sleep(350);
+
+            try
+            {
+                // 1) Two-finger parallel pan: the mechanism behind middle-drag & wheel.
+                double dPan2 = MeasurePan(engine, session, GestureEngine.ProbeKindPan2,
+                    p.X, p.Y, r, "두 손가락 팬", inv);
+
+                // 2) Single-finger pan, only when two-finger showed nothing and the
+                //    cursor is over empty canvas (else it would drag a shape).
+                if (double.IsNaN(dPan2) || Math.Abs(dPan2) < 20.0)
+                {
+                    if (session.TryBeginDrag(p.X, p.Y) != null)
+                        MeasurePan(engine, session, GestureEngine.ProbeKindPan1,
+                            p.X, p.Y, r, "한 손가락 팬", inv);
+                    else
+                        r.Append("한 손가락 팬: 건너뜀 (커서 아래가 빈 캔버스가 아님)\r\n");
+                }
+
+                // 3) Raw pinch (no compensation): where does PowerPoint anchor zoom?
+                MeasurePinch(engine, session, p.X, p.Y, canvasHwnd, r, inv);
+
+                // 4) Classic scrollbar messages as a pan fallback candidate.
+                MeasureScroll(session, canvasHwnd, r, inv);
+            }
+            catch (Exception ex)
+            {
+                r.Append("측정 중 오류: ").Append(ex.Message).Append("\r\n");
+            }
+            finally
+            {
+                if (zoomForced)
+                    session.TrySetZoom(zoom0);
+            }
+
+            string probe = engine.LastProbeReport;
+            if (probe != null)
+            {
+                r.Append("\r\n주입 파라미터 프로브:\r\n").Append(probe).Append("\r\n");
+            }
 
             r.Append("\r\n(이 창에서 Ctrl+C를 누르면 전체 내용이 복사됩니다.)");
             return r.ToString();
+        }
+
+        private static double MeasurePan(GestureEngine engine, PowerPointSession session,
+            int kind, int x, int y, StringBuilder r, string label, CultureInfo inv)
+        {
+            Vp before = ReadVp(session);
+            bool injected = engine.RunProbe(kind, x, y, 150.0);
+            Thread.Sleep(450);
+            Vp after = ReadVp(session);
+            engine.RunProbe(kind, x, y, -150.0); // put the view back
+            Thread.Sleep(250);
+
+            if (!injected)
+            {
+                r.Append(label).Append(": 주입 실패 (err=").Append(engine.LastInjectError).Append(")\r\n");
+                return double.NaN;
+            }
+            if (before == null || after == null)
+            {
+                r.Append(label).Append(": 측정 실패 (뷰포트 읽기 불가)\r\n");
+                return double.NaN;
+            }
+            double d = after.Ox - before.Ox;
+            r.Append(label).Append(": 손가락 +150px → 화면 ")
+             .Append(d.ToString("F0", inv)).Append("px ")
+             .Append(Math.Abs(d) >= 20.0 ? "이동 → 인식됨 ✓" : "이동 → 인식 안 됨 ✗").Append("\r\n");
+            return d;
+        }
+
+        private static void MeasurePinch(GestureEngine engine, PowerPointSession session,
+            int x, int y, IntPtr canvasHwnd, StringBuilder r, CultureInfo inv)
+        {
+            Vp before = ReadVp(session);
+            bool injected = engine.RunProbe(GestureEngine.ProbeKindPinch, x, y, 1.5);
+            Thread.Sleep(550);
+            Vp after = ReadVp(session);
+            engine.RunProbe(GestureEngine.ProbeKindPinch, x, y, 1.0 / 1.5);
+            Thread.Sleep(300);
+
+            if (!injected || before == null || after == null)
+            {
+                r.Append("핀치 줌: 측정 실패\r\n");
+                return;
+            }
+            r.Append("핀치 줌(보정 없음): 배율 ").Append(before.Zoom).Append("% → ").Append(after.Zoom).Append("%");
+            if (after.Zoom == before.Zoom)
+            {
+                r.Append("  → 줌 반응 없음 ✗\r\n");
+                return;
+            }
+
+            // Whichever screen point kept its slide coordinate is the real anchor.
+            double curBx = (x - before.Ox) / before.Sx;
+            double curBy = (y - before.Oy) / before.Sy;
+            double curAx = (x - after.Ox) / after.Sx;
+            double curAy = (y - after.Oy) / after.Sy;
+            double dCursor = Dist(curBx, curBy, curAx, curAy);
+
+            double dCenter = double.NaN;
+            RECT rc;
+            if (GetWindowRect(canvasHwnd, out rc))
+            {
+                double ccx = (rc.Left + rc.Right) / 2.0;
+                double ccy = (rc.Top + rc.Bottom) / 2.0;
+                double cenBx = (ccx - before.Ox) / before.Sx;
+                double cenBy = (ccy - before.Oy) / before.Sy;
+                double cenAx = (ccx - after.Ox) / after.Sx;
+                double cenAy = (ccy - after.Oy) / after.Sy;
+                dCenter = Dist(cenBx, cenBy, cenAx, cenAy);
+            }
+
+            r.Append("\r\n   앵커 측정: 커서점 이동 ").Append(dCursor.ToString("F1", inv))
+             .Append("pt / 화면중앙점 이동 ")
+             .Append(double.IsNaN(dCenter) ? "?" : dCenter.ToString("F1", inv))
+             .Append("pt → ");
+            if (!double.IsNaN(dCenter) && dCenter < dCursor * 0.5)
+                r.Append("중앙 기준 줌 (보정 필요, 이미 적용됨)\r\n");
+            else if (!double.IsNaN(dCenter) && dCursor < dCenter * 0.5)
+                r.Append("커서 기준 줌\r\n");
+            else
+                r.Append("불명확\r\n");
+        }
+
+        private static void MeasureScroll(PowerPointSession session, IntPtr canvasHwnd,
+            StringBuilder r, CultureInfo inv)
+        {
+            SCROLLINFO si = new SCROLLINFO();
+            si.Size = (uint)Marshal.SizeOf(typeof(SCROLLINFO));
+            si.Mask = SIF_ALL;
+            bool has = GetScrollInfo(canvasHwnd, SB_VERT, ref si);
+            r.Append("스크롤바 정보: ")
+             .Append(has
+                 ? "있음 (pos=" + si.Pos + ", range=" + si.Min + ".." + si.Max + ", page=" + si.Page + ")"
+                 : "없음")
+             .Append("\r\n");
+
+            Vp before = ReadVp(session);
+            IntPtr result;
+            for (int i = 0; i < 3; i++)
+                SendMessageTimeout(canvasHwnd, WM_VSCROLL, (IntPtr)SB_LINEDOWN, IntPtr.Zero,
+                    SMTO_ABORTIFHUNG, 500, out result);
+            Thread.Sleep(350);
+            Vp after = ReadVp(session);
+            for (int i = 0; i < 3; i++)
+                SendMessageTimeout(canvasHwnd, WM_VSCROLL, (IntPtr)SB_LINEUP, IntPtr.Zero,
+                    SMTO_ABORTIFHUNG, 500, out result);
+
+            if (before == null || after == null)
+            {
+                r.Append("WM_VSCROLL 테스트: 측정 실패\r\n");
+                return;
+            }
+            double d = after.Oy - before.Oy;
+            r.Append("WM_VSCROLL(라인 x3): 화면 ").Append(d.ToString("F0", inv)).Append("px ")
+             .Append(Math.Abs(d) >= 5.0 ? "이동 → 동작함 ✓" : "이동 → 반응 없음 ✗").Append("\r\n");
         }
     }
 }
