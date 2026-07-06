@@ -142,6 +142,12 @@ namespace PptFigmaDrag
         private int _roomsSampleTick;
         private int _wheelStartSlide;
         private int _lastNotchTick;
+        // Content signature of the sample the rooms were computed from. The COM
+        // viewport is frozen during gestures but sample TIMESTAMPS keep updating,
+        // so re-applying rooms per sample let the clamp ratchet forward with our
+        // own injections (tgt=1004 with 514px of room in the log). Only a sample
+        // whose CONTENT changed may re-anchor the rooms.
+        private double _appliedOx, _appliedOy, _appliedSx;
 
         // Recent (tick, injected pan) pairs. COM viewport samples lag behind the
         // injections; pairing a sample with the injected total AT ITS TIME (not
@@ -668,6 +674,9 @@ namespace PptFigmaDrag
             if (_roomNegY < 40.0) _roomNegY = 0.0;
             _roomsSampleTick = vs.TickMs;
             InjectedAt(vs.TickMs, out _wheelInjAtSampleX, out _wheelInjAtSampleY);
+            _appliedOx = vs.Ox;
+            _appliedOy = vs.Oy;
+            _appliedSx = vs.Sx;
         }
 
         private double ClampWheelTargetX(double target)
@@ -760,17 +769,26 @@ namespace PptFigmaDrag
                     ViewportState liveVs = _monitor.Current;
                     if (liveVs != null && liveVs.Valid)
                     {
+                        bool contentChanged = liveVs.Ox != _appliedOx ||
+                                              liveVs.Oy != _appliedOy ||
+                                              liveVs.Sx != _appliedSx;
                         if (_wheelStartSlide > 0 && liveVs.SlideIndex > 0 &&
                             liveVs.SlideIndex != _wheelStartSlide)
                         {
-                            // Escaped onto another slide despite the clamp: stop
-                            // pushing immediately; the monitor reverts the slide.
-                            DiagLog.Log("ENG", "wheel slide-escape " + _wheelStartSlide +
-                                "->" + liveVs.SlideIndex + ", freezing");
-                            _wheelTargetX = _wheelInjectedX;
-                            _wheelTargetY = _wheelInjectedY;
+                            // SlideIndex flickers to a neighboring slide during
+                            // gestures while Ox/Oy stay frozen (log: escape 17ms and
+                            // 40px into a 514px room). A real flip publishes new
+                            // coordinates - only then stop pushing.
+                            if (contentChanged)
+                            {
+                                DiagLog.Log("ENG", "wheel slide-escape " + _wheelStartSlide +
+                                    "->" + liveVs.SlideIndex + ", freezing");
+                                _wheelTargetX = _wheelInjectedX;
+                                _wheelTargetY = _wheelInjectedY;
+                            }
                         }
-                        else if (_wheelRectValid && liveVs.TickMs != _roomsSampleTick)
+                        else if (_wheelRectValid && contentChanged &&
+                                 liveVs.TickMs != _roomsSampleTick)
                         {
                             // NOTE: no stall detection here. The log proved the COM
                             // viewport is FROZEN while a gesture runs (inj=96,

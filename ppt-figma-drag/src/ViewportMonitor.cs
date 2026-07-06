@@ -63,6 +63,12 @@ namespace PptFigmaDrag
         private int _guardVerifyAtTick;
         private volatile bool _guardVerifyPending;
         private int _guardVerifyAttempts;
+        private bool _guardRevertedMidGesture;
+        // Content signature of the previous sample: SlideIndex flickers to a
+        // neighbor during gestures while the coordinates stay frozen, so an
+        // index change only counts as a real escape when Ox/Oy also moved.
+        private double _prevSampleOx, _prevSampleOy;
+        private bool _prevSampleValid;
 
         private StreamWriter _log;
         private int _logStartTick;
@@ -142,6 +148,7 @@ namespace PptFigmaDrag
                 }
                 _guardVerifyPending = false;
                 _guardVerifyAttempts = 0;
+                _guardRevertedMidGesture = false;
                 _guardArmed = true;
             }
             _signal.Set();
@@ -240,15 +247,28 @@ namespace PptFigmaDrag
                 }
 
                 // Escape detected while the gesture is still running: revert right
-                // away instead of waiting for the end-of-gesture deadline. The
-                // guard stays armed in case the gesture pushes out again.
-                if (_guardArmed && !_guardVerifyPending &&
+                // away instead of waiting for the end-of-gesture deadline. Only a
+                // sample whose coordinates actually moved counts (SlideIndex alone
+                // flickers during gestures - the log showed 12 false reverts in
+                // one session, each one resetting the user's view), and at most
+                // one mid-gesture revert per gesture.
+                if (_guardArmed && !_guardVerifyPending && !_guardRevertedMidGesture &&
                     _guardSlideIndex > 0 && vs.Valid && vs.SlideIndex > 0 &&
                     vs.SlideIndex != _guardSlideIndex &&
+                    _prevSampleValid &&
+                    (vs.Ox != _prevSampleOx || vs.Oy != _prevSampleOy) &&
                     Environment.TickCount - MouseHook.LastLeftClickTick >= 400)
                 {
                     DiagLog.Log("GUARD", "mid-gesture escape " + _guardSlideIndex + "->" + vs.SlideIndex);
+                    _guardRevertedMidGesture = true;
                     revertTo = _guardSlideIndex;
+                }
+
+                if (vs.Valid)
+                {
+                    _prevSampleOx = vs.Ox;
+                    _prevSampleOy = vs.Oy;
+                    _prevSampleValid = true;
                 }
 
                 if (_guardVerifyPending && Environment.TickCount - _guardVerifyAtTick >= 0)
