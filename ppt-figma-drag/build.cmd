@@ -7,6 +7,10 @@ rem  which is preinstalled on every Windows 10/11 machine.
 rem ---------------------------------------------------------------
 cd /d "%~dp0"
 
+rem Stop any running instance first. Otherwise the single-instance guard makes
+rem the freshly built exe exit immediately and you keep using the OLD tray app.
+taskkill /IM PptFigmaDrag.exe /F >nul 2>&1
+
 set CSC=%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe
 if not exist "%CSC%" set CSC=%WINDIR%\Microsoft.NET\Framework\v4.0.30319\csc.exe
 if not exist "%CSC%" (
@@ -25,8 +29,10 @@ rem read them with the system ANSI codepage and garble Korean string literals.
 
 if errorlevel 1 (
     echo [ERROR] Build failed.
+    pause
     exit /b 1
 )
 
 echo.
-echo [OK] Built PptFigmaDrag.exe - double-click it to run in the tray.
+echo [OK] Built PptFigmaDrag.exe - launching the fresh build now...
+start "" "%~dp0PptFigmaDrag.exe"
