@@ -156,7 +156,8 @@ namespace PptFigmaDrag
         }
         private volatile bool _enabled = true;
         private volatile bool _panZoomEnabled = true;
-        private bool _middleCaptured; // hook thread only
+        private bool _middleCaptured;    // hook thread only
+        private IntPtr _lastCanvasHwnd;  // hook thread only
 
         public bool Enabled
         {
@@ -390,20 +391,35 @@ namespace PptFigmaDrag
                     else
                     {
                         MSLLHOOKSTRUCT data = (MSLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(MSLLHOOKSTRUCT));
-                        IntPtr canvas;
+                        IntPtr canvas = IntPtr.Zero;
+                        bool onCanvas = false;
                         if (IsTouchSynthesized(ref data))
                             _lastWheelGate = "통과: 터치 합성 이벤트";
                         else if ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0)
                             _lastWheelGate = "통과: 왼쪽 버튼 드래그 중";
-                        else if (!IsOnPptCanvas(data.PtX, data.PtY, out canvas))
-                            _lastWheelGate = "통과: PPT 캔버스 아님";
+                        else
+                        {
+                            onCanvas = IsOnPptCanvas(data.PtX, data.PtY, out canvas);
+                            // Injected touch walks the pointer; while our wheel/pinch
+                            // gesture is live, keep routing notches to its canvas even
+                            // if the walked cursor strayed off it (else mid-gesture
+                            // notches fall through to PowerPoint natively).
+                            if (!onCanvas && _engine.WheelPinchActive && _lastCanvasHwnd != IntPtr.Zero)
+                            {
+                                canvas = _lastCanvasHwnd;
+                                onCanvas = true;
+                            }
+                            if (!onCanvas)
+                                _lastWheelGate = "통과: PPT 캔버스 아님";
+                        }
                         // NOTE: no foreground gate here. It misfired in real use (wheel
                         // and Ctrl+wheel silently fell through to PowerPoint's native
                         // scrolling/zoom - the "slides flip / centre zoom" symptoms)
                         // while middle-drag, which never had the gate, worked fine.
                         // Wheel over the canvas means the user wants PowerPoint anyway.
-                        else
+                        if (onCanvas)
                         {
+                            _lastCanvasHwnd = canvas;
                             int delta = WheelDelta(data.MouseData);
                             bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
                             bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;

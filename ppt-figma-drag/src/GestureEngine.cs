@@ -17,9 +17,13 @@ namespace PptFigmaDrag
         private const int MaxPanStepPx = 48;            // per-frame wheel-pan speed cap
         private const int GestureIdleEndMs = 140;       // no new notches -> finish gesture
         private const double ZoomFactorPerNotch = 1.15;
-        private const int PinchStartHalfPx = 70;
+        // Direction-aware start spread: a zoom-in leg grows 40->260 (6.5x) and a
+        // zoom-out leg shrinks 240->24 (10x), so continuous zooming rarely needs
+        // a mid-zoom re-anchor (each re-anchor risks a visible anchor wobble).
+        private const int PinchStartInHalfPx = 40;
+        private const int PinchStartOutHalfPx = 240;
         private const int PinchMinHalfPx = 24;
-        private const int PinchMaxHalfPx = 260;  // wider range -> fewer mid-zoom re-anchors
+        private const int PinchMaxHalfPx = 260;
         private const int MaxPinchStepPx = 14;
         private const int FreshStateWaitMs = 100;
         private const int SettleFrames = 4;            // ~64ms stationary before UP kills inertia
@@ -67,6 +71,10 @@ namespace PptFigmaDrag
         [DllImport("user32.dll")]
         private static extern short GetAsyncKeyState(int vKey);
 
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool SetCursorPos(int x, int y);
+
         private const int VK_MBUTTON = 0x04;
         private const int CanvasEdgeInsetPx = 12;      // re-anchor before fingers leave the canvas
         private const int PanWatchdogMs = 150;         // middle button seen released for this long -> end pan
@@ -80,8 +88,23 @@ namespace PptFigmaDrag
         private volatile bool _stop;
         private volatile bool _ready;
         private volatile bool _mousePanActive;
+        private volatile bool _wheelPinchActive;
         private volatile bool _selfTestOk;
         private volatile string _probeReport;
+
+        // Where the real pointer was when a wheel/pinch gesture began. Injected
+        // touch WALKS the visible cursor to the contact positions; it must be put
+        // back on gesture end or the next gesture anchors at the walked position
+        // (the "zoom anchor drifts" / "cursor slides to the screen edge" symptoms).
+        private int _restoreCursorX, _restoreCursorY;
+
+        // True while a wheel/pinch gesture is running; the hook keeps routing
+        // wheel notches to the gesture even though the walked cursor may no
+        // longer sit over the canvas.
+        public bool WheelPinchActive
+        {
+            get { return _wheelPinchActive; }
+        }
 
         // Latest cursor position while a mouse pan is active (coalesced). Packed
         // into one long so the engine thread never reads a torn x/y pair; only
@@ -442,18 +465,21 @@ namespace PptFigmaDrag
                         FinishGesture();
                     if (_state == GState.Idle)
                     {
+                        int startHalf = c.Dx >= 1.0 ? PinchStartInHalfPx : PinchStartOutHalfPx;
                         int cx = c.X, cy = c.Y;
-                        ClampContactCenter(c.CanvasHwnd, PinchStartHalfPx, ref cx, ref cy);
+                        ClampContactCenter(c.CanvasHwnd, startHalf, ref cx, ref cy);
                         _pinchCenterX = cx;
                         _pinchCenterY = cy;
-                        _pinchHalf = PinchStartHalfPx;
-                        _pinchTargetHalf = PinchStartHalfPx;
+                        _pinchHalf = startHalf;
+                        _pinchTargetHalf = startHalf;
                         // Measured on a real machine: PowerPoint anchors pinch zoom
                         // at the finger centroid (cursor point drift 1.1pt vs centre
                         // point 18.1pt), so a fixed centroid at the cursor IS the
                         // Figma-style zoom - no compensation needed.
                         _pinchCursorX = c.X;
                         _pinchCursorY = c.Y;
+                        _restoreCursorX = c.X;
+                        _restoreCursorY = c.Y;
                         _pinchCanvasHwnd = c.CanvasHwnd;
                         _pinchRectValid = c.CanvasHwnd != IntPtr.Zero &&
                                           GetWindowRect(c.CanvasHwnd, out _pinchRect);
@@ -461,6 +487,7 @@ namespace PptFigmaDrag
                                             (int)Math.Round(_pinchCenterX + _pinchHalf), cy))
                             break;
                         _state = GState.Pinch;
+                        _wheelPinchActive = true;
                         _monitor.BeginGestureSampling("pinch");
                     }
                     {
@@ -517,9 +544,12 @@ namespace PptFigmaDrag
             _wheelBaseY = startY;
             _wheelContactX = startX;
             _wheelContactY = startY;
+            _restoreCursorX = c.X;
+            _restoreCursorY = c.Y;
             if (!_injector.Down(startX - ContactSpreadPx, startY, startX + ContactSpreadPx, startY))
                 return false;
             _state = GState.WheelPan;
+            _wheelPinchActive = true;
             _monitor.BeginGestureSampling("wheel");
             _monitor.BeginSlideGuard(); // backstop in case a flip slips through anyway
             return true;
@@ -575,21 +605,23 @@ namespace PptFigmaDrag
         // exactly even while more pan lands between samples.
         private void ApplyRooms(ViewportState vs)
         {
-            // Vertical overshoot is what flips slides - keep a real safety gap.
-            const double vertSafetyPx = 12.0;
-            // Sideways there is no next slide: allow panning into the gray margin;
-            // PowerPoint clamps to its true scroll extent by itself.
-            const double horizSlackPx = 200.0;
+            // The canvas window rect includes chrome the viewport doesn't: the
+            // ruler sits at the TOP (about 26px), which made upward scrolling
+            // overshoot past the slide onto the previous one. Allow extra safety
+            // there; the bottom edge proved accurate in testing.
+            const double topSafetyPx = 40.0;
+            const double bottomSafetyPx = 12.0;
+            const double horizSafetyPx = 3.0;
 
             double slideRight = vs.Ox + vs.SlideWpt * vs.Sx;
             double slideBottom = vs.Oy + vs.SlideHpt * vs.Sy;
 
             // Content moving down/right (positive pan) is allowed until the slide
             // top/left edge reaches the canvas top/left edge, and vice versa.
-            _roomPosY = Math.Max(0.0, _wheelRect.Top - vs.Oy - vertSafetyPx);
-            _roomNegY = Math.Max(0.0, slideBottom - _wheelRect.Bottom - vertSafetyPx);
-            _roomPosX = Math.Max(0.0, _wheelRect.Left - vs.Ox) + horizSlackPx;
-            _roomNegX = Math.Max(0.0, slideRight - _wheelRect.Right) + horizSlackPx;
+            _roomPosY = Math.Max(0.0, _wheelRect.Top - vs.Oy - topSafetyPx);
+            _roomNegY = Math.Max(0.0, slideBottom - _wheelRect.Bottom - bottomSafetyPx);
+            _roomPosX = Math.Max(0.0, _wheelRect.Left - vs.Ox - horizSafetyPx);
+            _roomNegX = Math.Max(0.0, slideRight - _wheelRect.Right - horizSafetyPx);
             _roomsSampleTick = vs.TickMs;
             InjectedAt(vs.TickMs, out _wheelInjAtSampleX, out _wheelInjAtSampleY);
         }
@@ -780,18 +812,19 @@ namespace PptFigmaDrag
                             _injector.Hold();
                             _injector.Up();
 
+                            int startHalf = remaining >= 1.0 ? PinchStartInHalfPx : PinchStartOutHalfPx;
                             int ncx = (int)Math.Round(_pinchCursorX);
                             int ncy = (int)Math.Round(_pinchCursorY);
-                            ClampContactCenter(_pinchCanvasHwnd, PinchStartHalfPx, ref ncx, ref ncy);
+                            ClampContactCenter(_pinchCanvasHwnd, startHalf, ref ncx, ref ncy);
                             _pinchCenterX = ncx;
                             _pinchCenterY = ncy;
-                            _pinchHalf = PinchStartHalfPx;
-                            double newTarget = PinchStartHalfPx * remaining;
+                            _pinchHalf = startHalf;
+                            double newTarget = startHalf * remaining;
                             if (newTarget < PinchMinHalfPx) newTarget = PinchMinHalfPx;
                             if (newTarget > PinchMaxHalfPx) newTarget = PinchMaxHalfPx;
                             _pinchTargetHalf = newTarget;
 
-                            if (!_injector.Down(ncx - PinchStartHalfPx, ncy, ncx + PinchStartHalfPx, ncy))
+                            if (!_injector.Down(ncx - startHalf, ncy, ncx + startHalf, ncy))
                             {
                                 AbortGesture();
                                 break;
@@ -852,10 +885,16 @@ namespace PptFigmaDrag
                 _monitor.EndSlideGuard();
             if (_state != GState.Idle)
                 _monitor.EndGestureSampling();
+            // Injected touch walks the real pointer to the contact positions; put
+            // it back where the user left it, or the next wheel/zoom anchors at
+            // the walked position and the cursor creeps across the screen.
+            if (_state == GState.WheelPan || _state == GState.Pinch)
+                SetCursorPos(_restoreCursorX, _restoreCursorY);
             // Only a MousePan owns this flag: a PanStart command may have set it
             // eagerly for the NEXT gesture while we are closing the previous one.
             if (_state == GState.MousePan)
                 _mousePanActive = false;
+            _wheelPinchActive = false;
             _state = GState.Idle;
         }
 
