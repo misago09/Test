@@ -168,17 +168,13 @@ namespace PptFigmaDrag
                 _diagRunning = false;
             }
 
-            try { Clipboard.SetText(report); }
-            catch { }
-
-            // ServiceNotification keeps the unowned box on top - a plain
-            // worker-thread MessageBox can open BEHIND PowerPoint (which the
-            // measurement itself just brought to the foreground).
-            MessageBox.Show(
-                report + "\r\n\r\n(이 내용은 클립보드에 자동 복사되었습니다. 그대로 붙여넣어 공유하세요.)",
-                "PPT Figma Drag 진단",
-                MessageBoxButtons.OK, MessageBoxIcon.Information,
-                MessageBoxDefaultButton.Button1, MessageBoxOptions.ServiceNotification);
+            // A selectable, always-on-top window instead of a MessageBox: its text
+            // can be selected/copied directly, plus a retrying copy button and the
+            // saved-report folder, so the result can always be shared.
+            using (ReportForm form = new ReportForm(report, Diagnostics.ReportPath))
+            {
+                form.ShowDialog();
+            }
         }
 
         private void OnAutoStartChanged(object sender, EventArgs e)

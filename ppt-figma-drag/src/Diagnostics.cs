@@ -172,16 +172,23 @@ namespace PptFigmaDrag
 
             try
             {
-                string dir = System.IO.Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                    "PptFigmaDrag");
-                System.IO.Directory.CreateDirectory(dir);
-                System.IO.File.WriteAllText(System.IO.Path.Combine(dir, "diag-report.txt"), report);
+                System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(ReportPath));
+                System.IO.File.WriteAllText(ReportPath, report);
             }
             catch
             {
             }
             return report;
+        }
+
+        public static string ReportPath
+        {
+            get
+            {
+                return System.IO.Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "PptFigmaDrag", "diag-report.txt");
+            }
         }
 
         public static string Run(GestureEngine engine, MouseHook hook)
