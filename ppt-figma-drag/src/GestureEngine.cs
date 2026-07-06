@@ -139,6 +139,9 @@ namespace PptFigmaDrag
         private int _roomsSampleTick;
         private int _wheelStartSlide;
         private int _lastNotchTick;
+        // Previous live sample, for stall detection (fingers moving, view not).
+        private int _stallPrevTick;
+        private double _stallPrevOx, _stallPrevOy;
 
         // Recent (tick, injected pan) pairs. COM viewport samples lag behind the
         // injections; pairing a sample with the injected total AT ITS TIME (not
@@ -497,9 +500,14 @@ namespace PptFigmaDrag
                         if (atLowCap || atHighCap)
                         {
                             // Re-anchor: finish this pinch and start a fresh one so
-                            // long zooms are not limited by finger travel.
-                            FinishGesture();
+                            // long zooms are not limited by finger travel. The notch
+                            // event's coordinates are the WALKED cursor position -
+                            // keep the fresh leg anchored where the zoom began, or
+                            // the anchor creeps to the screen edge leg by leg.
                             Cmd again = c;
+                            again.X = (int)Math.Round(_pinchCursorX);
+                            again.Y = (int)Math.Round(_pinchCursorY);
+                            FinishGesture();
                             HandleCommand(again);
                             return;
                         }
@@ -613,17 +621,31 @@ namespace PptFigmaDrag
             const double bottomSafetyPx = 12.0;
             const double horizSafetyPx = 3.0;
 
+            // PowerPoint's true scroll extent is the slide PLUS gray margin. When
+            // the slide overflows the window, let the pan reach that margin - the
+            // stall detector and the slide guard stop us at the real extent. When
+            // the slide fully fits, keep everything pinned so gestures don't run
+            // dead (fingers moving, nothing scrolling).
+            double rectW = _wheelRect.Right - _wheelRect.Left;
+            double rectH = _wheelRect.Bottom - _wheelRect.Top;
+            bool overflow = vs.SlideWpt * vs.Sx > rectW || vs.SlideHpt * vs.Sy > rectH;
+            double marginY = overflow ? 60.0 : 0.0;   // vertical overshoot risks a slide flip
+            double marginX = overflow ? 250.0 : 0.0;  // sideways there is no next slide
+
             double slideRight = vs.Ox + vs.SlideWpt * vs.Sx;
             double slideBottom = vs.Oy + vs.SlideHpt * vs.Sy;
 
             // Content moving down/right (positive pan) is allowed until the slide
             // top/left edge reaches the canvas top/left edge, and vice versa.
-            _roomPosY = Math.Max(0.0, _wheelRect.Top - vs.Oy - topSafetyPx);
-            _roomNegY = Math.Max(0.0, slideBottom - _wheelRect.Bottom - bottomSafetyPx);
-            _roomPosX = Math.Max(0.0, _wheelRect.Left - vs.Ox - horizSafetyPx);
-            _roomNegX = Math.Max(0.0, slideRight - _wheelRect.Right - horizSafetyPx);
+            _roomPosY = Math.Max(0.0, _wheelRect.Top - vs.Oy - topSafetyPx) + marginY;
+            _roomNegY = Math.Max(0.0, slideBottom - _wheelRect.Bottom - bottomSafetyPx) + marginY;
+            _roomPosX = Math.Max(0.0, _wheelRect.Left - vs.Ox - horizSafetyPx) + marginX;
+            _roomNegX = Math.Max(0.0, slideRight - _wheelRect.Right - horizSafetyPx) + marginX;
             _roomsSampleTick = vs.TickMs;
             InjectedAt(vs.TickMs, out _wheelInjAtSampleX, out _wheelInjAtSampleY);
+            _stallPrevTick = vs.TickMs;
+            _stallPrevOx = vs.Ox;
+            _stallPrevOy = vs.Oy;
         }
 
         private double ClampWheelTargetX(double target)
@@ -726,6 +748,23 @@ namespace PptFigmaDrag
                         }
                         else if (_wheelRectValid && liveVs.TickMs != _roomsSampleTick)
                         {
+                            // Stall detection BEFORE the sample becomes the new
+                            // baseline: if the fingers moved but the view did not,
+                            // PowerPoint's real scroll extent is reached - stop
+                            // pushing (prevents dead finger/cursor travel and
+                            // pressure against the slide-flip boundary).
+                            double injPrevX, injPrevY, injNowX, injNowY;
+                            InjectedAt(_stallPrevTick, out injPrevX, out injPrevY);
+                            InjectedAt(liveVs.TickMs, out injNowX, out injNowY);
+                            double injDx = injNowX - injPrevX;
+                            double injDy = injNowY - injPrevY;
+                            double viewDx = liveVs.Ox - _stallPrevOx;
+                            double viewDy = liveVs.Oy - _stallPrevOy;
+                            if (Math.Abs(injDx) > 40.0 && Math.Abs(viewDx) < Math.Abs(injDx) * 0.15)
+                                _wheelTargetX = _wheelInjectedX;
+                            if (Math.Abs(injDy) > 40.0 && Math.Abs(viewDy) < Math.Abs(injDy) * 0.15)
+                                _wheelTargetY = _wheelInjectedY;
+
                             ApplyRooms(liveVs);
                             _wheelTargetX = ClampWheelTargetX(_wheelTargetX);
                             _wheelTargetY = ClampWheelTargetY(_wheelTargetY);
