@@ -64,6 +64,7 @@ namespace PptFigmaDrag
         private volatile bool _guardVerifyPending;
         private int _guardVerifyAttempts;
         private bool _guardRevertedMidGesture;
+        private int _guardVerifyStreak;
         // Content signature of the previous sample: SlideIndex flickers to a
         // neighbor during gestures while the coordinates stay frozen, so an
         // index change only counts as a real escape when Ox/Oy also moved.
@@ -148,6 +149,7 @@ namespace PptFigmaDrag
                 }
                 _guardVerifyPending = false;
                 _guardVerifyAttempts = 0;
+                _guardVerifyStreak = 0;
                 _guardRevertedMidGesture = false;
                 _guardArmed = true;
             }
@@ -273,7 +275,23 @@ namespace PptFigmaDrag
 
                 if (_guardVerifyPending && Environment.TickCount - _guardVerifyAtTick >= 0)
                 {
-                    if (!vs.Valid || vs.SlideIndex <= 0)
+                    if (Thread.VolatileRead(ref _activeGestures) > 0)
+                    {
+                        // Another gesture is running: the COM view (incl. SlideIndex)
+                        // is frozen/flickering, and log #3 showed verify firing a
+                        // GotoSlide into an active middle-drag. Wait it out.
+                        _guardVerifyAttempts++;
+                        if (_guardVerifyAttempts >= 40)
+                        {
+                            _guardVerifyPending = false;
+                            _guardArmed = false;
+                        }
+                        else
+                        {
+                            _guardVerifyAtTick = Environment.TickCount + 150;
+                        }
+                    }
+                    else if (!vs.Valid || vs.SlideIndex <= 0)
                     {
                         // Can't read the slide right now; retry a few times.
                         _guardVerifyAttempts++;
@@ -295,9 +313,26 @@ namespace PptFigmaDrag
                         bool userNavigated = Environment.TickCount - MouseHook.LastLeftClickTick < 400;
                         bool escaped = _guardSlideIndex > 0 && vs.SlideIndex != _guardSlideIndex;
                         if (escaped && !userNavigated)
-                            revertTo = _guardSlideIndex;
-                        _guardVerifyPending = false;
-                        _guardArmed = false;
+                        {
+                            // SlideIndex can flicker even between gestures; demand
+                            // two consecutive samples agreeing before undoing.
+                            _guardVerifyStreak++;
+                            if (_guardVerifyStreak >= 2)
+                            {
+                                revertTo = _guardSlideIndex;
+                                _guardVerifyPending = false;
+                                _guardArmed = false;
+                            }
+                            else
+                            {
+                                _guardVerifyAtTick = Environment.TickCount + 50;
+                            }
+                        }
+                        else
+                        {
+                            _guardVerifyPending = false;
+                            _guardArmed = false;
+                        }
                     }
                 }
             }

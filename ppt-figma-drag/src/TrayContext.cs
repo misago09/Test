@@ -39,6 +39,9 @@ namespace PptFigmaDrag
             _engine = new GestureEngine(_monitor);
             _hook = new MouseHook(_worker, _engine);
             _hook.Install();
+            // Prewarm the COM connection so the first wheel gesture after launch
+            // doesn't get dropped while GetActiveObject takes its ~0.7s.
+            _monitor.RequestSampleNow();
 
             _iconOn = CreateIcon(true);
             _iconOff = CreateIcon(false);
