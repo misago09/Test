@@ -132,6 +132,58 @@ namespace PptFigmaDrag
             return Math.Sqrt(dx * dx + dy * dy);
         }
 
+        // Step trail so a COM hang can be located: only one diagnostic runs at a
+        // time (TrayContext._diagRunning), so plain reassignment is safe.
+        private static volatile string _progress = "";
+
+        private static void Step(string name)
+        {
+            _progress = _progress + " → " + name;
+        }
+
+        // Runs the measurement on its own STA thread with a hard timeout, so a
+        // wedged COM call to PowerPoint can never make the diagnostic vanish
+        // without a trace. Also persists the report next to the viewport log.
+        public static string RunWithTimeout(GestureEngine engine, MouseHook hook, int timeoutMs)
+        {
+            _progress = "(시작)";
+            string[] result = new string[1];
+            Thread inner = new Thread(delegate()
+            {
+                try { result[0] = Run(engine, hook); }
+                catch (Exception ex) { result[0] = "진단 중 오류: " + ex; }
+            });
+            inner.SetApartmentState(ApartmentState.STA);
+            inner.IsBackground = true;
+            inner.Name = "PptFigmaDrag.DiagMeasure";
+            inner.Start();
+
+            string report;
+            if (!inner.Join(timeoutMs))
+            {
+                report = "⚠ 진단이 " + (timeoutMs / 1000) + "초 안에 끝나지 않아 중단했습니다.\r\n" +
+                         "PowerPoint COM 호출이 응답하지 않는 것으로 보입니다.\r\n" +
+                         "마지막으로 진행된 단계:\r\n" + _progress + "  ← 여기서 멈춤";
+            }
+            else
+            {
+                report = result[0];
+            }
+
+            try
+            {
+                string dir = System.IO.Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "PptFigmaDrag");
+                System.IO.Directory.CreateDirectory(dir);
+                System.IO.File.WriteAllText(System.IO.Path.Combine(dir, "diag-report.txt"), report);
+            }
+            catch
+            {
+            }
+            return report;
+        }
+
         public static string Run(GestureEngine engine, MouseHook hook)
         {
             CultureInfo inv = CultureInfo.InvariantCulture;
@@ -184,6 +236,7 @@ namespace PptFigmaDrag
             Thread.Sleep(200);
 
             r.Append("\r\n=== 자동 측정 (화면이 몇 초간 움직이는 것은 정상입니다) ===\r\n");
+            Step("뷰포트 읽기");
             PowerPointSession session = new PowerPointSession();
             Vp v0 = ReadVp(session);
             if (v0 == null)
@@ -195,6 +248,7 @@ namespace PptFigmaDrag
 
             // v0.Zoom can be 0 when the Zoom read failed; never "restore" to 0%.
             int zoom0 = v0.Zoom;
+            Step("배율 200% 설정");
             bool zoomForced = zoom0 > 0 && session.TrySetZoom(200);
             if (zoomForced)
                 Thread.Sleep(350);
@@ -202,6 +256,7 @@ namespace PptFigmaDrag
             try
             {
                 // 1) Two-finger parallel pan: the mechanism behind middle-drag & wheel.
+                Step("두 손가락 팬 측정");
                 double dPan2 = MeasurePan(engine, session, GestureEngine.ProbeKindPan2,
                     p.X, p.Y, r, "두 손가락 팬", inv);
 
@@ -209,6 +264,7 @@ namespace PptFigmaDrag
                 //    cursor is over empty canvas (else it would drag a shape).
                 if (double.IsNaN(dPan2) || Math.Abs(dPan2) < 20.0)
                 {
+                    Step("한 손가락 팬 측정");
                     if (session.TryBeginDrag(p.X, p.Y) != null)
                         MeasurePan(engine, session, GestureEngine.ProbeKindPan1,
                             p.X, p.Y, r, "한 손가락 팬", inv);
@@ -217,9 +273,11 @@ namespace PptFigmaDrag
                 }
 
                 // 3) Raw pinch (no compensation): where does PowerPoint anchor zoom?
+                Step("핀치 앵커 측정");
                 MeasurePinch(engine, session, p.X, p.Y, canvasHwnd, r, inv);
 
                 // 4) Classic scrollbar messages as a pan fallback candidate.
+                Step("스크롤바 테스트");
                 MeasureScroll(session, canvasHwnd, r, inv);
             }
             catch (Exception ex)
@@ -228,8 +286,10 @@ namespace PptFigmaDrag
             }
             finally
             {
+                Step("배율 복원");
                 if (zoomForced)
                     session.TrySetZoom(zoom0);
+                Step("완료");
             }
 
             string probe = engine.LastProbeReport;

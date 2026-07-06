@@ -157,7 +157,7 @@ namespace PptFigmaDrag
             string report;
             try
             {
-                report = Diagnostics.Run(_engine, _hook);
+                report = Diagnostics.RunWithTimeout(_engine, _hook, 45000);
             }
             catch (Exception ex)
             {
@@ -167,8 +167,18 @@ namespace PptFigmaDrag
             {
                 _diagRunning = false;
             }
-            MessageBox.Show(report, "PPT Figma Drag 진단",
-                MessageBoxButtons.OK, MessageBoxIcon.Information);
+
+            try { Clipboard.SetText(report); }
+            catch { }
+
+            // ServiceNotification keeps the unowned box on top - a plain
+            // worker-thread MessageBox can open BEHIND PowerPoint (which the
+            // measurement itself just brought to the foreground).
+            MessageBox.Show(
+                report + "\r\n\r\n(이 내용은 클립보드에 자동 복사되었습니다. 그대로 붙여넣어 공유하세요.)",
+                "PPT Figma Drag 진단",
+                MessageBoxButtons.OK, MessageBoxIcon.Information,
+                MessageBoxDefaultButton.Button1, MessageBoxOptions.ServiceNotification);
         }
 
         private void OnAutoStartChanged(object sender, EventArgs e)

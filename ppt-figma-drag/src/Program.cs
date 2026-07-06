@@ -21,6 +21,22 @@ namespace PptFigmaDrag
 
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
+
+                // A silent crash looks like "nothing happened"; always say something.
+                Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+                Application.ThreadException += delegate(object sender, System.Threading.ThreadExceptionEventArgs e)
+                {
+                    MessageBox.Show("오류가 발생했습니다:\r\n" + e.Exception, "PPT Figma Drag",
+                        MessageBoxButtons.OK, MessageBoxIcon.Error,
+                        MessageBoxDefaultButton.Button1, MessageBoxOptions.ServiceNotification);
+                };
+                AppDomain.CurrentDomain.UnhandledException += delegate(object sender, UnhandledExceptionEventArgs e)
+                {
+                    MessageBox.Show("치명적 오류로 종료됩니다:\r\n" + e.ExceptionObject, "PPT Figma Drag",
+                        MessageBoxButtons.OK, MessageBoxIcon.Error,
+                        MessageBoxDefaultButton.Button1, MessageBoxOptions.ServiceNotification);
+                };
+
                 Application.Run(new TrayContext());
                 GC.KeepAlive(mutex);
             }
