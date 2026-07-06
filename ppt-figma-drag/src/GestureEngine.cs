@@ -18,9 +18,9 @@ namespace PptFigmaDrag
         private const int GestureIdleEndMs = 140;       // no new notches -> finish gesture
         private const double ZoomFactorPerNotch = 1.15;
         private const int PinchStartHalfPx = 70;
-        private const int PinchMinHalfPx = 26;
-        private const int PinchMaxHalfPx = 230;
-        private const int MaxPinchStepPx = 10;
+        private const int PinchMinHalfPx = 24;
+        private const int PinchMaxHalfPx = 260;  // wider range -> fewer mid-zoom re-anchors
+        private const int MaxPinchStepPx = 14;
         private const int FreshStateWaitMs = 100;
         private const int SettleFrames = 4;            // ~64ms stationary before UP kills inertia
 
@@ -109,7 +109,11 @@ namespace PptFigmaDrag
         private double _wheelContactX, _wheelContactY;   // current contact centre
         private RECT _wheelRect;
         private bool _wheelRectValid;
+        // Scroll room measured at _roomsSampleTick, when _wheelInjAtSample* had
+        // been injected. Valid target range: injAtSample - roomNeg .. + roomPos.
         private double _roomPosX, _roomNegX, _roomPosY, _roomNegY;
+        private double _wheelInjAtSampleX, _wheelInjAtSampleY;
+        private int _roomsSampleTick;
         private int _lastNotchTick;
 
         // Pinch
@@ -374,8 +378,8 @@ namespace PptFigmaDrag
                         if (!BeginWheelGesture(c))
                             break;
                     }
-                    _wheelTargetX = ClampPan(_wheelTargetX + c.Dx, _roomNegX, _roomPosX);
-                    _wheelTargetY = ClampPan(_wheelTargetY + c.Dy, _roomNegY, _roomPosY);
+                    _wheelTargetX = ClampWheelTargetX(_wheelTargetX + c.Dx);
+                    _wheelTargetY = ClampWheelTargetY(_wheelTargetY + c.Dy);
                     _lastNotchTick = Environment.TickCount;
                     break;
 
@@ -444,83 +448,121 @@ namespace PptFigmaDrag
 
         private bool BeginWheelGesture(Cmd c)
         {
-            bool clamped = ComputeWheelRooms(c.CanvasHwnd);
-            _wheelGestureCount++;
-            _lastRoomsInfo = (clamped ? "클램프 적용" : "클램프 없음(뷰포트 샘플 실패)") +
-                " / 위로 " + (int)_roomPosY + "px, 아래로 " + (int)_roomNegY +
-                "px, 왼쪽 " + (int)_roomPosX + "px, 오른쪽 " + (int)_roomNegX + "px";
             _wheelTargetX = 0.0;
             _wheelTargetY = 0.0;
             _wheelInjectedX = 0.0;
             _wheelInjectedY = 0.0;
+            bool clamped = ComputeWheelRooms(c.CanvasHwnd);
+            _wheelGestureCount++;
+            _lastRoomsInfo = (clamped ? "클램프 적용" : "뷰포트 확인 실패 → 휠 입력 무시") +
+                " / 위로 " + (int)_roomPosY + "px, 아래로 " + (int)_roomNegY +
+                "px, 왼쪽 " + (int)_roomPosX + "px, 오른쪽 " + (int)_roomNegX + "px";
+            // Requirement: the wheel must NEVER land on another slide. Without
+            // viewport info we cannot bound the pan, so dropping the notch is
+            // strictly better than guessing.
+            if (!clamped)
+                return false;
+            // No scroll room in the requested direction (e.g. the slide fits the
+            // window): don't bother with a gesture that would move nothing.
+            if (Math.Abs(ClampWheelTargetX(c.Dx)) < 1.0 &&
+                Math.Abs(ClampWheelTargetY(c.Dy)) < 1.0)
+                return false;
+
             int startX = c.X, startY = c.Y;
             ClampContactCenter(c.CanvasHwnd, ContactSpreadPx, ref startX, ref startY);
             _wheelBaseX = startX;
             _wheelBaseY = startY;
             _wheelContactX = startX;
             _wheelContactY = startY;
-            _wheelRectValid = c.CanvasHwnd != IntPtr.Zero && GetWindowRect(c.CanvasHwnd, out _wheelRect);
-            if (!_wheelRectValid)
-            {
-                _wheelRect.Left = _wheelRect.Top = _wheelRect.Right = _wheelRect.Bottom = 0;
-            }
             if (!_injector.Down(startX - ContactSpreadPx, startY, startX + ContactSpreadPx, startY))
                 return false;
             _state = GState.WheelPan;
             _monitor.BeginGestureSampling("wheel");
-            // With valid rooms the pan mathematically cannot leave the slide, so
-            // the guard would only risk reverting the user's own navigation; arm
-            // it solely for the unclamped fallback.
-            if (!clamped)
-                _monitor.BeginSlideGuard();
+            _monitor.BeginSlideGuard(); // backstop in case a flip slips through anyway
             return true;
         }
 
         // How far the view may pan in each direction without leaving the current
         // slide (which is what makes PowerPoint jump to the next/previous one).
-        // Returns true when real rooms were computed, false for the unclamped
-        // fallback (which needs the slide guard as backstop).
+        // Returns false when the viewport could not be established - the caller
+        // must then drop the wheel input entirely.
         private bool ComputeWheelRooms(IntPtr canvasHwnd)
         {
-            _roomPosX = _roomNegX = _roomPosY = _roomNegY = 100000.0; // no clamp fallback
+            _roomPosX = _roomNegX = _roomPosY = _roomNegY = 0.0;
+            _wheelInjAtSampleX = _wheelInjectedX;
+            _wheelInjAtSampleY = _wheelInjectedY;
 
-            // Only a sample taken for THIS gesture is trustworthy - an older one
-            // predates whatever zoom/scroll/slide change happened since.
-            int requestTick = Environment.TickCount;
-            _monitor.RequestSampleNow();
-            ViewportState vs = null;
-            for (int waited = 0; waited <= FreshStateWaitMs; waited += 10)
-            {
-                ViewportState candidate = _monitor.Current;
-                if (candidate != null && candidate.Valid &&
-                    candidate.TickMs - requestTick >= -30)
-                {
-                    vs = candidate;
-                    break;
-                }
-                // A middle-drag pan wants to start: don't make it wait on COM.
-                Cmd pending;
-                if (_queue.TryPeek(out pending) && pending.Kind == CmdKind.PanStart)
-                    break;
-                Thread.Sleep(10);
-            }
-            if (vs == null)
-                return false; // unclamped; the slide guard is the backstop
-
-            RECT canvas;
-            if (canvasHwnd == IntPtr.Zero || !GetWindowRect(canvasHwnd, out canvas))
+            _wheelRectValid = canvasHwnd != IntPtr.Zero && GetWindowRect(canvasHwnd, out _wheelRect);
+            if (!_wheelRectValid)
                 return false;
 
+            // During rapid scrolling the monitor is already sampling at ~66Hz, so
+            // a recent sample is fine; only genuinely stale data forces a wait.
+            ViewportState vs = _monitor.Current;
+            if (vs == null || !vs.Valid || Environment.TickCount - vs.TickMs >= 700)
+            {
+                int requestTick = Environment.TickCount;
+                _monitor.RequestSampleNow();
+                vs = null;
+                for (int waited = 0; waited <= FreshStateWaitMs; waited += 10)
+                {
+                    ViewportState candidate = _monitor.Current;
+                    if (candidate != null && candidate.Valid &&
+                        candidate.TickMs - requestTick >= -30)
+                    {
+                        vs = candidate;
+                        break;
+                    }
+                    // A middle-drag pan wants to start: don't make it wait on COM.
+                    Cmd pending;
+                    if (_queue.TryPeek(out pending) && pending.Kind == CmdKind.PanStart)
+                        break;
+                    Thread.Sleep(10);
+                }
+                if (vs == null)
+                    return false;
+            }
+
+            ApplyRooms(vs);
+            return true;
+        }
+
+        // Rooms are measured relative to the view at the sample's time; the pan
+        // injected up to that moment is snapshotted so targets can be clamped
+        // exactly even while more pan lands between samples.
+        private void ApplyRooms(ViewportState vs)
+        {
+            const double edgeSafetyPx = 3.0;
             double slideRight = vs.Ox + vs.SlideWpt * vs.Sx;
             double slideBottom = vs.Oy + vs.SlideHpt * vs.Sy;
 
             // Content moving down/right (positive pan) is allowed until the slide
             // top/left edge reaches the canvas top/left edge, and vice versa.
-            _roomPosY = Math.Max(0.0, canvas.Top - vs.Oy);
-            _roomNegY = Math.Max(0.0, slideBottom - canvas.Bottom);
-            _roomPosX = Math.Max(0.0, canvas.Left - vs.Ox);
-            _roomNegX = Math.Max(0.0, slideRight - canvas.Right);
-            return true;
+            _roomPosY = Math.Max(0.0, _wheelRect.Top - vs.Oy - edgeSafetyPx);
+            _roomNegY = Math.Max(0.0, slideBottom - _wheelRect.Bottom - edgeSafetyPx);
+            _roomPosX = Math.Max(0.0, _wheelRect.Left - vs.Ox - edgeSafetyPx);
+            _roomNegX = Math.Max(0.0, slideRight - _wheelRect.Right - edgeSafetyPx);
+            _roomsSampleTick = vs.TickMs;
+            _wheelInjAtSampleX = _wheelInjectedX;
+            _wheelInjAtSampleY = _wheelInjectedY;
+        }
+
+        private double ClampWheelTargetX(double target)
+        {
+            double lo = _wheelInjAtSampleX - _roomNegX;
+            double hi = _wheelInjAtSampleX + _roomPosX;
+            if (target < lo) return lo;
+            if (target > hi) return hi;
+            return target;
+        }
+
+        private double ClampWheelTargetY(double target)
+        {
+            double lo = _wheelInjAtSampleY - _roomNegY;
+            double hi = _wheelInjAtSampleY + _roomPosY;
+            if (target < lo) return lo;
+            if (target > hi) return hi;
+            return target;
         }
 
         // Shifts a gesture centre so that contacts spread +-halfSpread horizontally
@@ -540,13 +582,6 @@ namespace PptFigmaDrag
                 return (lo + hi) / 2; // canvas smaller than the spread: best effort
             if (v < lo) return lo;
             if (v > hi) return hi;
-            return v;
-        }
-
-        private static double ClampPan(double v, double roomNeg, double roomPos)
-        {
-            if (v > roomPos) return roomPos;
-            if (v < -roomNeg) return -roomNeg;
             return v;
         }
 
@@ -596,6 +631,18 @@ namespace PptFigmaDrag
 
                 case GState.WheelPan:
                 {
+                    // Live re-clamp: the monitor keeps sampling during the gesture,
+                    // and each fresh sample re-anchors the allowed range, so the pan
+                    // cannot cross the slide edge even when notches keep arriving.
+                    ViewportState liveVs = _monitor.Current;
+                    if (_wheelRectValid && liveVs != null && liveVs.Valid &&
+                        liveVs.TickMs != _roomsSampleTick)
+                    {
+                        ApplyRooms(liveVs);
+                        _wheelTargetX = ClampWheelTargetX(_wheelTargetX);
+                        _wheelTargetY = ClampWheelTargetY(_wheelTargetY);
+                    }
+
                     bool moved = false;
                     double stepX = ClampStep(_wheelTargetX - _wheelInjectedX, MaxPanStepPx);
                     double stepY = ClampStep(_wheelTargetY - _wheelInjectedY, MaxPanStepPx);
@@ -613,7 +660,9 @@ namespace PptFigmaDrag
                              nextY > _wheelRect.Bottom - CanvasEdgeInsetPx))
                         {
                             _injector.Hold();
-                            Thread.Sleep(FrameMs);
+                            Thread.Sleep(FrameMs * 2);
+                            _injector.Hold();
+                            Thread.Sleep(FrameMs * 2);
                             _injector.Hold();
                             _injector.Up();
                             if (!_injector.Down((int)Math.Round(_wheelBaseX - ContactSpreadPx), (int)Math.Round(_wheelBaseY),
@@ -667,7 +716,9 @@ namespace PptFigmaDrag
                         {
                             double remaining = prevHalf > 0.0 ? _pinchTargetHalf / prevHalf : 1.0;
                             _injector.Hold();
-                            Thread.Sleep(FrameMs);
+                            Thread.Sleep(FrameMs * 2);
+                            _injector.Hold();
+                            Thread.Sleep(FrameMs * 2);
                             _injector.Hold();
                             _injector.Up();
 
