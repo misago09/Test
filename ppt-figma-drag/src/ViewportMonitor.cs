@@ -156,6 +156,21 @@ namespace PptFigmaDrag
             _signal.Set();
         }
 
+        // A wheel gesture's guard must only ever judge that wheel gesture's own
+        // effect. When a different gesture (pinch zoom / middle-drag pan) starts,
+        // whatever it does to the view is the user's intent - cancel any pending
+        // wheel verify instead of "reverting" the new gesture's outcome.
+        public void CancelSlideGuard()
+        {
+            lock (_guardLock)
+            {
+                if (_guardArmed || _guardVerifyPending)
+                    DiagLog.Log("GUARD", "cancelled (non-wheel gesture started)");
+                _guardArmed = false;
+                _guardVerifyPending = false;
+            }
+        }
+
         public void EndSlideGuard()
         {
             lock (_guardLock)

@@ -407,6 +407,7 @@ namespace PptFigmaDrag
                 {
                     if (_state != GState.Idle)
                         FinishGesture();
+                    _monitor.CancelSlideGuard(); // the pan owns the view from here
                     _panCursorX = c.X;
                     _panCursorY = c.Y;
                     _lastInjectedStamp = -1;
@@ -505,6 +506,7 @@ namespace PptFigmaDrag
                             break;
                         _state = GState.Pinch;
                         _wheelPinchActive = true;
+                        _monitor.CancelSlideGuard(); // the zoom owns the view from here
                         _monitor.BeginGestureSampling("pinch");
                         DiagLog.Log("ENG", "pinch start @(" + c.X + "," + c.Y + ") half=" + startHalf);
                     }
