@@ -349,8 +349,11 @@ namespace PptFigmaDrag
                             _lastWheelGate = "통과: 왼쪽 버튼 드래그 중";
                         else if (!IsOnPptCanvas(data.PtX, data.PtY, out canvas))
                             _lastWheelGate = "통과: PPT 캔버스 아님";
-                        else if (GetForegroundWindow() != GetAncestor(canvas, GA_ROOT))
-                            _lastWheelGate = "통과: PPT가 활성 창 아님";
+                        // NOTE: no foreground gate here. It misfired in real use (wheel
+                        // and Ctrl+wheel silently fell through to PowerPoint's native
+                        // scrolling/zoom - the "slides flip / centre zoom" symptoms)
+                        // while middle-drag, which never had the gate, worked fine.
+                        // Wheel over the canvas means the user wants PowerPoint anyway.
                         else
                         {
                             int delta = WheelDelta(data.MouseData);

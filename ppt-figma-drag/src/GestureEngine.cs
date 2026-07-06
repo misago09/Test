@@ -115,10 +115,7 @@ namespace PptFigmaDrag
         // Pinch
         private double _pinchCenterX, _pinchCenterY;
         private double _pinchHalf, _pinchTargetHalf;
-        private double _pinchStartHalf = PinchStartHalfPx;
-        private double _pinchCursorX, _pinchCursorY; // the point the zoom should anchor to
-        private double _pinchViewCenterX, _pinchViewCenterY; // where PowerPoint actually anchors
-        private bool _pinchCompensate;
+        private double _pinchCursorX, _pinchCursorY; // re-anchor point for fresh legs
         private RECT _pinchRect;
         private bool _pinchRectValid;
         private IntPtr _pinchCanvasHwnd;
@@ -408,22 +405,15 @@ namespace PptFigmaDrag
                         _pinchCenterY = cy;
                         _pinchHalf = PinchStartHalfPx;
                         _pinchTargetHalf = PinchStartHalfPx;
-                        _pinchStartHalf = PinchStartHalfPx;
-                        // PowerPoint's canvas zooms about the viewport centre, not
-                        // the finger centroid. To anchor at the cursor we pan the
-                        // fingers while pinching, by (cursor-centre)*(1-f).
+                        // Measured on a real machine: PowerPoint anchors pinch zoom
+                        // at the finger centroid (cursor point drift 1.1pt vs centre
+                        // point 18.1pt), so a fixed centroid at the cursor IS the
+                        // Figma-style zoom - no compensation needed.
                         _pinchCursorX = c.X;
                         _pinchCursorY = c.Y;
-                        _pinchCompensate = false;
                         _pinchCanvasHwnd = c.CanvasHwnd;
                         _pinchRectValid = c.CanvasHwnd != IntPtr.Zero &&
                                           GetWindowRect(c.CanvasHwnd, out _pinchRect);
-                        if (_pinchRectValid)
-                        {
-                            _pinchViewCenterX = (_pinchRect.Left + _pinchRect.Right) / 2.0;
-                            _pinchViewCenterY = (_pinchRect.Top + _pinchRect.Bottom) / 2.0;
-                            _pinchCompensate = true;
-                        }
                         if (!_injector.Down((int)Math.Round(_pinchCenterX - _pinchHalf), cy,
                                             (int)Math.Round(_pinchCenterX + _pinchHalf), cy))
                             break;
@@ -662,22 +652,13 @@ namespace PptFigmaDrag
                     {
                         double prevHalf = _pinchHalf;
                         _pinchHalf = StepToward(_pinchHalf, _pinchTargetHalf, MaxPinchStepPx);
-                        // PowerPoint zooms about the viewport centre; translating the
-                        // fingers by (cursor-centre)*(1-f) while pinching drags the
-                        // zoomed content back so the cursor point stays put.
                         double cx = _pinchCenterX;
                         double cy = _pinchCenterY;
-                        if (_pinchCompensate && _pinchStartHalf > 0.0)
-                        {
-                            double f = _pinchHalf / _pinchStartHalf;
-                            cx += (_pinchCursorX - _pinchViewCenterX) * (1.0 - f);
-                            cy += (_pinchCursorY - _pinchViewCenterY) * (1.0 - f);
-                        }
 
-                        // The compensation offset grows without bound; if the pair is
-                        // about to leave the canvas (where the virtual-screen clamp
-                        // would silently truncate the pan and break the anchor), lift
-                        // and restart a fresh leg at the cursor with the residual zoom.
+                        // If the spreading pair is about to leave the canvas (where
+                        // the virtual-screen clamp would shift the centroid and drag
+                        // the zoom anchor off the cursor), lift and restart a fresh
+                        // leg at the cursor with the residual zoom.
                         if (_pinchRectValid &&
                             (cx - _pinchHalf < _pinchRect.Left + CanvasEdgeInsetPx ||
                              cx + _pinchHalf > _pinchRect.Right - CanvasEdgeInsetPx ||
@@ -696,7 +677,6 @@ namespace PptFigmaDrag
                             _pinchCenterX = ncx;
                             _pinchCenterY = ncy;
                             _pinchHalf = PinchStartHalfPx;
-                            _pinchStartHalf = PinchStartHalfPx;
                             double newTarget = PinchStartHalfPx * remaining;
                             if (newTarget < PinchMinHalfPx) newTarget = PinchMinHalfPx;
                             if (newTarget > PinchMaxHalfPx) newTarget = PinchMaxHalfPx;

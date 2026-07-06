@@ -305,7 +305,7 @@ namespace PptFigmaDrag
                 r.Append("\r\n주입 파라미터 프로브:\r\n").Append(probe).Append("\r\n");
             }
 
-            r.Append("\r\n(이 창에서 Ctrl+C를 누르면 전체 내용이 복사됩니다.)");
+            r.Append("\r\n(아래 [전체 복사] 버튼을 누르거나 텍스트를 직접 선택해 복사하세요.)");
             return r.ToString();
         }
 
