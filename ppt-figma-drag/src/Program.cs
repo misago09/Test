@@ -22,6 +22,12 @@ namespace PptFigmaDrag
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
 
+                // Event log is ALWAYS on (fresh file per session): every debugging
+                // round so far was slowed by "was logging even enabled / which
+                // build ran?" - this removes both questions.
+                DiagLog.Enabled = true;
+                DiagLog.Log("APP", "start");
+
                 // A silent crash looks like "nothing happened"; always say something.
                 Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
                 Application.ThreadException += delegate(object sender, System.Threading.ThreadExceptionEventArgs e)

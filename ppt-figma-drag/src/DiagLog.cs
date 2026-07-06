@@ -41,6 +41,12 @@ namespace PptFigmaDrag
                             _writer.AutoFlush = true;
                             _writer.WriteLine("=== PPT Figma Drag event log " +
                                 DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + " ===");
+                            // The exe timestamp instantly answers "is this the build
+                            // we think it is?" - a recurring failure mode.
+                            string exe = System.Reflection.Assembly.GetExecutingAssembly().Location;
+                            _writer.WriteLine("exe: " + exe);
+                            _writer.WriteLine("built: " + File.GetLastWriteTime(exe)
+                                .ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture));
                         }
                         catch
                         {

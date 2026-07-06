@@ -61,6 +61,9 @@ namespace PptFigmaDrag
             _diagItem = new ToolStripMenuItem("🔍 진단 실행 (3초 후 커서 위치 검사)");
             _diagItem.Click += OnRunDiagnostics;
 
+            ToolStripMenuItem openLogDirItem = new ToolStripMenuItem("📁 로그 폴더 열기");
+            openLogDirItem.Click += OnOpenLogDir;
+
             _diagTimer = new Timer();
             _diagTimer.Interval = 3000;
             _diagTimer.Tick += OnDiagTimerTick;
@@ -86,6 +89,7 @@ namespace PptFigmaDrag
             menu.Items.Add(_panZoomItem);
             menu.Items.Add(_logItem);
             menu.Items.Add(_diagItem);
+            menu.Items.Add(openLogDirItem);
             menu.Items.Add(_autoStartItem);
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(exitItem);
@@ -118,16 +122,32 @@ namespace PptFigmaDrag
             _notifyIcon.Icon = anyOn ? _iconOn : _iconOff;
         }
 
+        // The event log (event-log.txt) is always on; this toggle only adds the
+        // high-rate viewport CSV used for magnet verification.
         private void OnLogChanged(object sender, EventArgs e)
         {
             _monitor.LoggingEnabled = _logItem.Checked;
-            DiagLog.Enabled = _logItem.Checked;
             if (_logItem.Checked)
             {
                 _notifyIcon.BalloonTipTitle = "PPT Figma Drag";
-                _notifyIcon.BalloonTipText = "기록 중: event-log.txt + viewport-log.csv\r\n" +
+                _notifyIcon.BalloonTipText = "viewport-log.csv 기록 시작 (event-log.txt는 항상 기록됩니다)\r\n" +
                     System.IO.Path.GetDirectoryName(DiagLog.LogPath);
                 _notifyIcon.ShowBalloonTip(4000);
+            }
+        }
+
+        private void OnOpenLogDir(object sender, EventArgs e)
+        {
+            try
+            {
+                string dir = System.IO.Path.GetDirectoryName(DiagLog.LogPath);
+                System.IO.Directory.CreateDirectory(dir);
+                System.Diagnostics.Process.Start("explorer.exe", "\"" + dir + "\"");
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("로그 폴더를 열지 못했습니다:\r\n" + ex.Message,
+                    "PPT Figma Drag", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
         }
 

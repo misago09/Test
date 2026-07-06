@@ -198,6 +198,15 @@ namespace PptFigmaDrag
             r.Append("=== PPT Figma Drag 진단 v2 (자동 측정) ===\r\n");
             r.Append("OS 버전: ").Append(Environment.OSVersion.Version.ToString())
              .Append(Environment.Is64BitProcess ? "  (64-bit)" : "  (32-bit)").Append("\r\n");
+            try
+            {
+                string exe = System.Reflection.Assembly.GetExecutingAssembly().Location;
+                r.Append("빌드 시각: ").Append(System.IO.File.GetLastWriteTime(exe)
+                    .ToString("yyyy-MM-dd HH:mm:ss", inv)).Append("\r\n");
+            }
+            catch
+            {
+            }
             bool remote = GetSystemMetrics(SM_REMOTESESSION) != 0;
             r.Append("실행 환경: ").Append(remote ? "원격 세션 ⚠" : "로컬 콘솔").Append("\r\n");
             r.Append("터치 주입 초기화: ").Append(engine.Ready ? "성공 ✓" : "실패 ✗").Append("\r\n\r\n");
